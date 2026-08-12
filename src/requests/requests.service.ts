@@ -4701,6 +4701,28 @@ export class RequestsService {
     dto: CreateRequestDto | UpdateRequestDto,
     existingZoneId?: any,
   ) {
+    let roomIds: number[] = [];
+    let roomNames: string[] = [];
+
+    const roomNosVal = (dto as any).Room_Nos !== undefined ? (dto as any).Room_Nos : (dto as any).room_nos;
+    if (roomNosVal !== undefined && roomNosVal !== null) {
+      if (Array.isArray(roomNosVal)) {
+        roomNosVal.forEach((item) => {
+          const s = String(item).trim();
+          if (/^\d+$/.test(s)) roomIds.push(Number(s));
+          else if (s) roomNames.push(s);
+        });
+      } else if (typeof roomNosVal === 'string') {
+        String(roomNosVal).split(',').forEach((item) => {
+          const s = item.trim();
+          if (/^\d+$/.test(s)) roomIds.push(Number(s));
+          else if (s) roomNames.push(s);
+        });
+      } else if (typeof roomNosVal === 'number' && roomNosVal > 0) {
+        roomIds.push(roomNosVal);
+      }
+    }
+
     let zoneIds: number[] = [];
     const zoneIdVal = dto.Zone_Id !== undefined ? dto.Zone_Id : existingZoneId;
     if (zoneIdVal !== undefined && zoneIdVal !== null) {
@@ -4713,29 +4735,59 @@ export class RequestsService {
           .split(',')
           .map((id) => Number(id.trim()))
           .filter((id) => !isNaN(id) && id > 0);
-      } else if (typeof zoneIdVal === 'number') {
-        zoneIds = zoneIdVal > 0 ? [zoneIdVal] : [];
+      } else if (typeof zoneIdVal === 'number' && zoneIdVal > 0) {
+        zoneIds = [zoneIdVal];
       }
     }
 
-    if (zoneIds.length > 0) {
+    let rooms: Room[] = [];
+    if (roomIds.length > 0) {
+      rooms = await this.roomRepo.find({ where: { room_id: In(roomIds) } });
+    }
+    if (rooms.length === 0 && roomNames.length > 0) {
+      rooms = await this.roomRepo.find({ where: { room_name: In(roomNames) } });
+    }
+    if (rooms.length === 0 && zoneIds.length > 0) {
+      rooms = await this.roomRepo.find({ where: { zone_id: In(zoneIds) } });
+    }
+
+    if (rooms.length === 0 && (roomIds.length > 0 || roomNames.length > 0)) {
+      throw new BadRequestException('Selected rooms not found');
+    }
+
+    if (rooms.length === 0 && zoneIds.length > 0) {
       const zones = await this.zoneRepo.find({
         where: { id: In(zoneIds) },
       });
       if (zones.length === 0) {
         throw new BadRequestException('Selected zones not found');
       }
-      const statuses = zones.map((z) => (z.status || '').toUpperCase().trim());
-      if (statuses.includes('HO')) {
-        throw new BadRequestException(
-          'Cannot create a permit if zone status is HO',
-        );
+      const zoneStatuses = zones.map((z) => (z.status || 'UC').toUpperCase().trim());
+      if (zoneStatuses.includes('HO') || zoneStatuses.includes('HAND OVER')) {
+        throw new BadRequestException('Cannot create a permit if room status is HO');
+      }
+      const uniqueZoneStatuses = Array.from(new Set(zoneStatuses));
+      if (uniqueZoneStatuses.length > 1) {
+        throw new BadRequestException('All selected rooms must belong to the same status');
+      }
+      const commonStatus = uniqueZoneStatuses[0];
+      if (commonStatus === 'UC') {
+        dto.permit_under = 'Construction';
+      } else if (commonStatus === 'C') {
+        dto.permit_under = 'Commissioning';
+      }
+      dto.Zone_Id = zoneIds.join(',');
+      return;
+    }
+
+    if (rooms.length > 0) {
+      const statuses = rooms.map((r) => (r.status || 'UC').toUpperCase().trim());
+      if (statuses.includes('HO') || statuses.includes('HAND OVER')) {
+        throw new BadRequestException('Cannot create a permit if room status is HO');
       }
       const uniqueStatuses = Array.from(new Set(statuses));
       if (uniqueStatuses.length > 1) {
-        throw new BadRequestException(
-          'All selected zones must belong to the same status',
-        );
+        throw new BadRequestException('All selected rooms must belong to the same status');
       }
       const commonStatus = uniqueStatuses[0];
       if (commonStatus === 'UC') {
@@ -4743,7 +4795,9 @@ export class RequestsService {
       } else if (commonStatus === 'C') {
         dto.permit_under = 'Commissioning';
       }
-      dto.Zone_Id = zoneIds.join(',');
+      if (zoneIds.length > 0) {
+        dto.Zone_Id = zoneIds.join(',');
+      }
     }
   }
 
@@ -5481,18 +5535,45 @@ export class RequestsService {
       throw new BadRequestException('Permit number not found');
     }
 
-    // 3. Validate zones exist and have consistent status (lookup by IDs)
-    const zoneEntities = await this.zoneRepo.findBy({ id: In(zoneIds) });
-    if (!zoneEntities || zoneEntities.length === 0) {
-      throw new BadRequestException('Zone not found');
+    // 3. Validate rooms/zones exist and have consistent status
+    let roomEntities: Room[] = [];
+    const targetRoomNos = dto.Room_Nos || originalRequest.roomNos;
+    if (targetRoomNos) {
+      const roomParts = String(targetRoomNos).split(',').map((s) => s.trim()).filter(Boolean);
+      const roomIds = roomParts.map((s) => Number(s)).filter((n) => !isNaN(n) && n > 0);
+      if (roomIds.length > 0) {
+        roomEntities = await this.roomRepo.find({ where: { room_id: In(roomIds) } });
+      }
+      if (roomEntities.length === 0 && roomParts.length > 0) {
+        roomEntities = await this.roomRepo.find({ where: { room_name: In(roomParts) } });
+      }
+    }
+    if (roomEntities.length === 0 && zoneIds.length > 0) {
+      roomEntities = await this.roomRepo.find({ where: { zone_id: In(zoneIds) } });
     }
 
-    const statuses = [...new Set(zoneEntities.map((z) => (z.status || '').toUpperCase().trim()))];
-    if (statuses.length > 1) {
-      throw new BadRequestException('Zones have different status');
+    let roomStatus = 'UC';
+    if (roomEntities.length > 0) {
+      const statuses = [...new Set(roomEntities.map((r) => (r.status || 'UC').toUpperCase().trim()))];
+      if (statuses.length > 1) {
+        throw new BadRequestException('Rooms have different status');
+      }
+      roomStatus = statuses[0];
+    } else if (zoneIds.length > 0) {
+      const zoneEntities = await this.zoneRepo.findBy({ id: In(zoneIds) });
+      if (!zoneEntities || zoneEntities.length === 0) {
+        throw new BadRequestException('Zone not found');
+      }
+      const statuses = [...new Set(zoneEntities.map((z) => (z.status || 'UC').toUpperCase().trim()))];
+      if (statuses.length > 1) {
+        throw new BadRequestException('Zones have different status');
+      }
+      roomStatus = statuses[0];
     }
 
-    const zoneStatus = statuses[0];
+    if (roomStatus === 'HO' || roomStatus === 'HAND OVER') {
+      throw new BadRequestException('Permit not allowed to copy to Hand Over rooms');
+    }
 
     // 4. Determine permit type of original
     const permitType =
@@ -5500,10 +5581,10 @@ export class RequestsService {
         ? 'Construction'
         : (originalRequest.permitUnder || '').trim();
 
-    if (zoneStatus === 'UC' && permitType === 'Commissioning') {
+    if (roomStatus === 'UC' && permitType === 'Commissioning') {
       throw new BadRequestException('Permit not allowed to copy');
     }
-    if (zoneStatus === 'C' && permitType === 'Construction') {
+    if (roomStatus === 'C' && permitType === 'Construction') {
       throw new BadRequestException('Permit not allowed to copy');
     }
 
@@ -5554,6 +5635,7 @@ export class RequestsService {
 
     // 7. Resolve zone and zoneId safely truncated to max 250 characters
     const resolvedZoneId = zoneIds.join(',').substring(0, 250);
+    const zoneEntities = zoneIds.length > 0 ? await this.zoneRepo.findBy({ id: In(zoneIds) }) : [];
     const fetchedZoneNames = zoneEntities.map((z) => z.zone).filter(Boolean);
     const combinedZoneNames = zoneNamesFromDto.length > 0 ? zoneNamesFromDto.join(',') : fetchedZoneNames.join(',');
     const resolvedZone = (combinedZoneNames || originalRequest.zone || '').substring(0, 250);

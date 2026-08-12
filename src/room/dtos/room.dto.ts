@@ -23,6 +23,10 @@ export class CreateRoomDto {
   @IsInt()
   @IsOptional()
   zone_id?: number;
+
+  @IsString()
+  @IsOptional()
+  status?: string;
 }
 
 export class UpdateRoomDto {
@@ -46,6 +50,10 @@ export class UpdateRoomDto {
   @IsInt()
   @IsOptional()
   zone_id?: number;
+
+  @IsString()
+  @IsOptional()
+  status?: string;
 }
 
 export class RoomQueryDto extends PaginationQueryDto {
@@ -57,4 +65,8 @@ export class RoomQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsString()
   search?: string;
+
+  @IsOptional()
+  @IsString()
+  status?: string;
 }

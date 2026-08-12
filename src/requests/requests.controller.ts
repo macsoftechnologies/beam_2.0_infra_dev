@@ -14,6 +14,7 @@ import {
   Res,
   UseGuards,
   Request,
+  HttpException,
 } from '@nestjs/common';
 import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -207,10 +208,7 @@ export class RequestsController {
       return await this.requestsService.createByCount(dto);
     } catch (error) {
       const status = typeof error.getStatus === 'function' ? error.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
-      return {
-        status,
-        message: error.message || 'Create by count failed',
-      };
+      throw new HttpException(error.message || 'Create by count failed', status);
     }
   }
 

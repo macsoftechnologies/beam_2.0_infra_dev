@@ -11,8 +11,14 @@ describe('RequestsService - Validation and Zone Logic', () => {
   let mockDepartmentRepo: any;
   let mockRequestRepo: any;
 
+  let mockRoomRepo: any;
+
   beforeEach(() => {
     mockZoneRepo = {
+      find: jest.fn(),
+    };
+
+    mockRoomRepo = {
       find: jest.fn(),
     };
 
@@ -64,7 +70,7 @@ describe('RequestsService - Validation and Zone Logic', () => {
       {} as any, // buildingRepo
       {} as any, // floorRepo
       mockZoneRepo, // zoneRepo
-      {} as any, // roomRepo
+      mockRoomRepo, // roomRepo
       {} as any, // subcontractorRepo
       {} as any, // activityRepo
       mockUserRepo, // userRepo
@@ -79,58 +85,56 @@ describe('RequestsService - Validation and Zone Logic', () => {
   });
 
   describe('checkZoneStatusAndAssignPermitUnder', () => {
-    it('should throw BadRequestException if selected zones are not found', async () => {
-      mockZoneRepo.find.mockResolvedValue([]);
-      const dto: CreateRequestDto = { Zone_Id: 999 };
+    it('should throw BadRequestException if selected rooms are not found', async () => {
+      mockRoomRepo.find.mockResolvedValue([]);
+      const dto: CreateRequestDto = { Room_Nos: '999' };
 
       await expect(
         service['checkZoneStatusAndAssignPermitUnder'](dto),
-      ).rejects.toThrow(new BadRequestException('Selected zones not found'));
+      ).rejects.toThrow(new BadRequestException('Selected rooms not found'));
     });
 
-    it('should throw BadRequestException if zone status is HO', async () => {
-      mockZoneRepo.find.mockResolvedValue([{ id: 1, status: 'HO' }]);
-      const dto: CreateRequestDto = { Zone_Id: 1 };
+    it('should throw BadRequestException if room status is HO', async () => {
+      mockRoomRepo.find.mockResolvedValue([{ room_id: 1, status: 'HO' }]);
+      const dto: CreateRequestDto = { Room_Nos: '1' };
 
       await expect(
         service['checkZoneStatusAndAssignPermitUnder'](dto),
       ).rejects.toThrow(
-        new BadRequestException('Cannot create a permit if zone status is HO'),
+        new BadRequestException('Cannot create a permit if room status is HO'),
       );
     });
 
-    it('should throw BadRequestException if selected zones have mixed statuses', async () => {
-      mockZoneRepo.find.mockResolvedValue([
-        { id: 1, status: 'UC' },
-        { id: 2, status: 'C' },
+    it('should throw BadRequestException if selected rooms have mixed statuses', async () => {
+      mockRoomRepo.find.mockResolvedValue([
+        { room_id: 1, status: 'UC' },
+        { room_id: 2, status: 'C' },
       ]);
-      const dto: CreateRequestDto = { Zone_Id: '1,2' };
+      const dto: CreateRequestDto = { Room_Nos: '1,2' };
 
       await expect(
         service['checkZoneStatusAndAssignPermitUnder'](dto),
       ).rejects.toThrow(
         new BadRequestException(
-          'All selected zones must belong to the same status',
+          'All selected rooms must belong to the same status',
         ),
       );
     });
 
-    it('should assign permit_under to Construction if status is UC', async () => {
-      mockZoneRepo.find.mockResolvedValue([{ id: 3, status: 'UC' }]);
-      const dto: CreateRequestDto = { Zone_Id: 3 };
+    it('should assign permit_under to Construction if room status is UC', async () => {
+      mockRoomRepo.find.mockResolvedValue([{ room_id: 3, status: 'UC' }]);
+      const dto: CreateRequestDto = { Room_Nos: '3' };
 
       await service['checkZoneStatusAndAssignPermitUnder'](dto);
       expect(dto.permit_under).toBe('Construction');
-      expect(dto.Zone_Id).toBe(3);
     });
 
-    it('should assign permit_under to Commissioning if status is C', async () => {
-      mockZoneRepo.find.mockResolvedValue([{ id: 4, status: 'C' }]);
-      const dto: CreateRequestDto = { Zone_Id: 4 };
+    it('should assign permit_under to Commissioning if room status is C', async () => {
+      mockRoomRepo.find.mockResolvedValue([{ room_id: 4, status: 'C' }]);
+      const dto: CreateRequestDto = { Room_Nos: '4' };
 
       await service['checkZoneStatusAndAssignPermitUnder'](dto);
       expect(dto.permit_under).toBe('Commissioning');
-      expect(dto.Zone_Id).toBe(4);
     });
 
     it('should ignore zone ID if it is 0 or non-positive', async () => {
