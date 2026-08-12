@@ -860,7 +860,7 @@ export class RequestsService {
     });
 
     // 1. Validate zone status and set permit_under dynamically
-    await this.checkZoneStatusAndAssignPermitUnder(dto, existing.zoneId);
+    await this.checkZoneStatusAndAssignPermitUnder(dto, existing.zoneId, existing.roomNos);
 
     // 2. Validate mandatory fields (non-draft)
     this.validateMandatoryFields(dto, existing, {
@@ -4700,11 +4700,15 @@ export class RequestsService {
   private async checkZoneStatusAndAssignPermitUnder(
     dto: CreateRequestDto | UpdateRequestDto,
     existingZoneId?: any,
+    existingRoomNos?: any,
   ) {
     let roomIds: number[] = [];
     let roomNames: string[] = [];
 
-    const roomNosVal = (dto as any).Room_Nos !== undefined ? (dto as any).Room_Nos : (dto as any).room_nos;
+    let roomNosVal = (dto as any).Room_Nos !== undefined ? (dto as any).Room_Nos : (dto as any).room_nos;
+    if ((roomNosVal === undefined || roomNosVal === null || String(roomNosVal).trim() === '') && existingRoomNos) {
+      roomNosVal = existingRoomNos;
+    }
     if (roomNosVal !== undefined && roomNosVal !== null) {
       if (Array.isArray(roomNosVal)) {
         roomNosVal.forEach((item) => {
