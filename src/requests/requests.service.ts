@@ -3100,6 +3100,40 @@ export class RequestsService {
           qb.andWhere('ppe.respiratory_protection = 1');
         }
 
+        // Electrical Works Filter
+        if (dto.electrical_works && String(dto.electrical_works).trim() !== '') {
+          const elecItems = this.parseStringList(dto.electrical_works);
+          if (elecItems.length > 0) {
+            const elecConds = elecItems.map((item, idx) => 
+              `(FIND_IN_SET(:elecItem_${idx}, extraMisc.electricalWorks) > 0 OR CONCAT(',', extraMisc.electricalWorks, ',') LIKE :elecWorkComma_${idx} OR extraMisc.electricalWorks LIKE :elecWork_${idx})`
+            );
+            const params: Record<string, string> = {};
+            elecItems.forEach((item, idx) => {
+              params[`elecItem_${idx}`] = item;
+              params[`elecWorkComma_${idx}`] = `%,${item},%`;
+              params[`elecWork_${idx}`] = `%${item}%`;
+            });
+            qb.andWhere(`(${elecConds.join(' OR ')})`, params);
+          }
+        }
+
+        // Mechanical Works Filter
+        if (dto.mechanical_works && String(dto.mechanical_works).trim() !== '') {
+          const mechItems = this.parseStringList(dto.mechanical_works);
+          if (mechItems.length > 0) {
+            const mechConds = mechItems.map((item, idx) => 
+              `(FIND_IN_SET(:mechItem_${idx}, extraMisc.mechanicalWorks) > 0 OR CONCAT(',', extraMisc.mechanicalWorks, ',') LIKE :mechWorkComma_${idx} OR extraMisc.mechanicalWorks LIKE :mechWork_${idx})`
+            );
+            const params: Record<string, string> = {};
+            mechItems.forEach((item, idx) => {
+              params[`mechItem_${idx}`] = item;
+              params[`mechWorkComma_${idx}`] = `%,${item},%`;
+              params[`mechWork_${idx}`] = `%${item}%`;
+            });
+            qb.andWhere(`(${mechConds.join(' OR ')})`, params);
+          }
+        }
+
         if (
           dto.hras !== undefined &&
           dto.hras !== null &&
@@ -3320,7 +3354,8 @@ export class RequestsService {
       'work_in_atex_area', 'securing_facilities', 'excavation_works',
       'specific_gloves', 'eye_protection', 'fall_protection', 'hearing_protection',
       'respiratory_protection', 'taskSpecificPPE', 'power_on', 'pressurization',
-      'fromDate', 'toDate', 'Start_Time', 'End_Time', 'Zone_Id', 'zone', 'zoneIds', 'Room_Nos', 'Floor_Id', 'Type_Of_Activity_Id', 'PermitNo', 'Activity'
+      'fromDate', 'toDate', 'Start_Time', 'End_Time', 'Zone_Id', 'zone', 'zoneIds', 'Room_Nos', 'Floor_Id', 'Type_Of_Activity_Id', 'PermitNo', 'Activity',
+      'electrical_works', 'mechanical_works'
     ];
     const filteredSearchDto: PlanSearchDto = {};
     for (const key of allowedKeys) {
@@ -3689,6 +3724,40 @@ export class RequestsService {
         }
         if (searchDto.pressurization && Number(searchDto.pressurization) === 1) {
           qb.andWhere('energisingMechanical.pressurization = :pressur', { pressur: searchDto.pressurization });
+        }
+
+        // Electrical Works Filter
+        if (searchDto.electrical_works && String(searchDto.electrical_works).trim() !== '') {
+          const elecItems = this.parseStringList(searchDto.electrical_works);
+          if (elecItems.length > 0) {
+            const elecConds = elecItems.map((item, idx) => 
+              `(FIND_IN_SET(:planElecItem_${idx}, extraMisc.electricalWorks) > 0 OR CONCAT(',', extraMisc.electricalWorks, ',') LIKE :planElecWorkComma_${idx} OR extraMisc.electricalWorks LIKE :planElecWork_${idx})`
+            );
+            const params: Record<string, string> = {};
+            elecItems.forEach((item, idx) => {
+              params[`planElecItem_${idx}`] = item;
+              params[`planElecWorkComma_${idx}`] = `%,${item},%`;
+              params[`planElecWork_${idx}`] = `%${item}%`;
+            });
+            qb.andWhere(`(${elecConds.join(' OR ')})`, params);
+          }
+        }
+
+        // Mechanical Works Filter
+        if (searchDto.mechanical_works && String(searchDto.mechanical_works).trim() !== '') {
+          const mechItems = this.parseStringList(searchDto.mechanical_works);
+          if (mechItems.length > 0) {
+            const mechConds = mechItems.map((item, idx) => 
+              `(FIND_IN_SET(:planMechItem_${idx}, extraMisc.mechanicalWorks) > 0 OR CONCAT(',', extraMisc.mechanicalWorks, ',') LIKE :planMechWorkComma_${idx} OR extraMisc.mechanicalWorks LIKE :planMechWork_${idx})`
+            );
+            const params: Record<string, string> = {};
+            mechItems.forEach((item, idx) => {
+              params[`planMechItem_${idx}`] = item;
+              params[`planMechWorkComma_${idx}`] = `%,${item},%`;
+              params[`planMechWork_${idx}`] = `%${item}%`;
+            });
+            qb.andWhere(`(${mechConds.join(' OR ')})`, params);
+          }
         }
 
         // --- No pagination — fetch all records ---

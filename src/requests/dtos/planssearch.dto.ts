@@ -219,4 +219,12 @@ export class PlanSearchDto {
     @IsOptional()
     @IsString()
     Activity?: string;
+
+    @IsOptional()
+    @IsString()
+    electrical_works?: string;
+
+    @IsOptional()
+    @IsString()
+    mechanical_works?: string;
 }

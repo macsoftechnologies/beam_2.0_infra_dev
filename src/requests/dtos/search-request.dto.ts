@@ -227,4 +227,12 @@ export class SearchRequestDto {
   @IsString()
   @IsOptional()
   permit_under_filter?: string;
+
+  @IsString()
+  @IsOptional()
+  electrical_works?: string;
+
+  @IsString()
+  @IsOptional()
+  mechanical_works?: string;
 }
