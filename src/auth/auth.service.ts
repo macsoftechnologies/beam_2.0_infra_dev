@@ -14,6 +14,8 @@ import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { EmailService } from '../notifications/services/email.service';
+import { SmsService } from '../notifications/services/sms.service';
 
 @Injectable()
 export class AuthService {
@@ -22,10 +24,32 @@ export class AuthService {
     private jwtService: JwtService,
     private otpService: OtpService,
     private redisCacheService: RedisCacheService,
+    private emailService: EmailService,
+    private smsService: SmsService,
 
     @InjectRepository(Employee)
     private readonly employeeRepo: Repository<Employee>,
   ) { }
+
+  private maskEmail(email: string): string {
+    if (!email) return '';
+    const parts = email.split('@');
+    if (parts.length !== 2) return email;
+    const [name, domain] = parts;
+    if (name.length <= 2) {
+      return `${name[0]}*@${domain}`;
+    }
+    const firstChar = name[0];
+    const lastChar = name[name.length - 1];
+    return `${firstChar}${'*'.repeat(Math.max(1, Math.min(name.length - 2, 5)))}${lastChar}@${domain}`;
+  }
+
+  private maskPhone(phone: string): string {
+    if (!phone) return '';
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length <= 4) return digits;
+    return `****${digits.slice(-4)}`;
+  }
 
   /**
    * Register a new user
@@ -77,21 +101,69 @@ export class AuthService {
     // Update user with OTP
     await this.usersService.updateOtp(user.id, otp);
 
-    // Fetch phone number from Employee table
+    // Fetch phone number, email and notification type from Employee table
     const employee = (user.empId !== null && user.empId !== undefined)
       ? await this.employeeRepo.findOne({ where: { id: user.empId } })
       : null;
     const phoneNumber = employee?.phonenumber ?? '';
+    const email = employee?.email ?? '';
+    const rawOtpType = String(employee?.otpNotificationType || 'SMS').toUpperCase();
+    const shouldSendEmail = rawOtpType === 'EMAIL' || rawOtpType === 'BOTH' || (rawOtpType.includes('EMAIL') && rawOtpType.includes('SMS'));
+    const shouldSendSms = rawOtpType === 'SMS' || rawOtpType === 'BOTH' || (rawOtpType.includes('EMAIL') && rawOtpType.includes('SMS'));
 
-    // Send OTP via SMS using Twilio
+    let emailSent = false;
     let smsSent = false;
+    let maskedPhone = '';
+    let maskedEmail = '';
+
     if (phoneNumber) {
-      smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+      maskedPhone = this.maskPhone(phoneNumber);
+    }
+    if (email) {
+      maskedEmail = this.maskEmail(email);
     }
 
-    // Fallback: log OTP to server console for development/testing
-    if (!smsSent) {
-      console.log(`[OTP - LOGIN] User: ${username} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'}`);
+    if (shouldSendEmail && email) {
+      const html = `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <h2 style="color: #0f172a; margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.5px;">BEAM Platform</h2>
+            <p style="color: #64748b; margin-top: 6px; font-size: 14px;">Secure Login Verification</p>
+          </div>
+          <p style="color: #334155; font-size: 15px; margin-bottom: 12px;">Hello <strong>${employee?.employeeName || user.username}</strong>,</p>
+          <p style="color: #475569; font-size: 14px; line-height: 1.5; margin-bottom: 24px;">Please use the one-time security code below to complete your login to the BEAM Portal:</p>
+          <div style="text-align: center; margin: 28px 0;">
+            <div style="display: inline-block; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #4338ca; background: #eef2ff; padding: 14px 28px; border-radius: 8px; border: 1.5px dashed #6366f1;">
+              ${otp}
+            </div>
+          </div>
+          <p style="color: #64748b; font-size: 13px; line-height: 1.5;">This code will expire in <strong>5 minutes</strong>. If you did not request this login code, please contact your system administrator immediately.</p>
+          <hr style="border: none; border-top: 1px solid #f1f5f9; margin: 24px 0;" />
+          <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">SafeSiteWorks - BEAM System</p>
+        </div>
+      `;
+      emailSent = await this.emailService.sendEmail({
+        to: email,
+        subject: 'BEAM - Login Security Code',
+        text: `Your BEAM login verification code is: ${otp}. It expires in 5 minutes.`,
+        html,
+      });
+      if (!emailSent) {
+        console.log(`[OTP - LOGIN VIA EMAIL] User: ${username} | OTP: ${otp} | Email: ${email || 'N/A'}`);
+      }
+    }
+
+    if (shouldSendSms && phoneNumber) {
+      smsSent = await this.smsService.sendSms(
+        phoneNumber,
+        `Your BEAM login verification code is: ${otp}. Valid for 5 minutes.`,
+      );
+      if (!smsSent) {
+        smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+      }
+      if (!smsSent) {
+        console.log(`[OTP - LOGIN VIA SMS] User: ${username} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'}`);
+      }
     }
 
     // Generate auth token (legacy support)
@@ -101,23 +173,69 @@ export class AuthService {
     // Save auth token
     await this.usersService.updateAuthToken(user.id, authToken);
 
-    // Mask phone number for display (show last 4 digits only)
-    const maskedPhone = phoneNumber
-      ? phoneNumber.replace(/\D/g, '').slice(-4).padStart(phoneNumber.replace(/\D/g, '').length, '*')
-      : '';
+    if (!maskedPhone && phoneNumber) {
+      maskedPhone = this.maskPhone(phoneNumber);
+    }
+    if (!maskedEmail && email) {
+      maskedEmail = this.maskEmail(email);
+    }
+
+    const allModules = 'permit-to-work,incident-management,safety-observations,safety-inspection,spot-checks';
+    const isUserAdmin = ['admin', 'superadmin'].includes(String(user.userType || '').toLowerCase());
+    const moduleAccess = isUserAdmin ? allModules : (employee?.moduleAccess || 'permit-to-work');
+
+    const isBoth = shouldSendEmail && shouldSendSms;
+    const isEmail = shouldSendEmail && !shouldSendSms;
+    const resolvedOtpType = isBoth ? 'BOTH' : (isEmail ? 'EMAIL' : 'SMS');
+
+    let responseMsg = '';
+    if (isBoth) {
+      responseMsg = `Login successful. OTP sent to your registered email (${maskedEmail || 'email'}) and phone number (${maskedPhone || 'phone'}).`;
+    } else if (isEmail) {
+      responseMsg = `Login successful. OTP sent to your registered email address${maskedEmail ? ` (${maskedEmail})` : ''}.`;
+    } else {
+      responseMsg = `Login successful. OTP sent to your registered phone number${maskedPhone ? ` ending in ${maskedPhone}` : ''}.`;
+    }
+
+    let subContractorName: string | null = null;
+    if (employee?.subContId) {
+      try {
+        const subRows = await this.employeeRepo.query(
+          `SELECT subContractorName FROM subcontractors WHERE id = ? LIMIT 1`,
+          [employee.subContId],
+        );
+        if (subRows && subRows.length > 0) {
+          subContractorName = subRows[0].subContractorName;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
 
     return {
       statusCode: HttpStatus.OK,
-      message: 'Login successful. OTP sent to your registered phone number.',
+      message: responseMsg,
       id: user.id,
       username: user.username,
       userType: user.userType,
       typeId: user.typeId,
       empId: user.empId,
+      departId: employee?.departId ?? null,
+      subContId: employee?.subContId ?? null,
+      subcontractor_id: employee?.subContId ?? null,
+      subContractorId: employee?.subContId ?? null,
+      subContractorName: subContractorName ?? null,
+      companyName: employee?.companyName ?? null,
+      obserId: employee?.obserId ?? null,
       phonenumber: phoneNumber,
+      email,
+      otpNotificationType: resolvedOtpType,
       maskedPhone,
+      maskedEmail,
+      moduleAccess,
       auth_token: authToken,
       sms_sent: smsSent,
+      email_sent: emailSent,
     };
   }
 
@@ -133,19 +251,36 @@ export class AuthService {
       throw new UnauthorizedException('User not found');
     }
 
-    // Allow static dev OTP bypass via environment variable
-    const staticOtp = process.env.DEV_STATIC_OTP;
-    const isStaticOtpMatch = staticOtp && otp === staticOtp;
-
-    // Validate OTP against stored value
-    if (!isStaticOtpMatch) {
-      if (!user.otp || user.otp !== otp) {
-        throw new UnauthorizedException('Invalid OTP. Please check the code sent to your phone.');
-      }
+    // Strictly verify OTP sent via SMS or Email
+    if (!user.otp || String(user.otp).trim() !== String(otp).trim()) {
+      throw new UnauthorizedException('Invalid OTP. Please enter the verification code sent to your registered email or phone.');
     }
 
     // Clear OTP after successful verification
     await this.usersService.clearOtp(user.id);
+
+    // Fetch employee for moduleAccess
+    const employee = (user.empId !== null && user.empId !== undefined)
+      ? await this.employeeRepo.findOne({ where: { id: user.empId } })
+      : null;
+    const allModules = 'permit-to-work,incident-management,safety-observations,safety-inspection,spot-checks';
+    const isUserAdmin = ['admin', 'superadmin'].includes(String(user.userType || '').toLowerCase());
+    const moduleAccess = isUserAdmin ? allModules : (employee?.moduleAccess || 'permit-to-work');
+
+    let subContractorName: string | null = null;
+    if (employee?.subContId) {
+      try {
+        const subRows = await this.employeeRepo.query(
+          `SELECT subContractorName FROM subcontractors WHERE id = ? LIMIT 1`,
+          [employee.subContId],
+        );
+        if (subRows && subRows.length > 0) {
+          subContractorName = subRows[0].subContractorName;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
 
     // Generate JWT token
     const payload = { sub: user.id, username: user.username };
@@ -159,6 +294,14 @@ export class AuthService {
       userType: user.userType,
       typeId: user.typeId,
       empId: user.empId,
+      departId: employee?.departId ?? null,
+      subContId: employee?.subContId ?? null,
+      subcontractor_id: employee?.subContId ?? null,
+      subContractorId: employee?.subContId ?? null,
+      subContractorName: subContractorName ?? null,
+      companyName: employee?.companyName ?? null,
+      obserId: employee?.obserId ?? null,
+      moduleAccess,
       access_token,
     };
   }
@@ -185,34 +328,93 @@ export class AuthService {
     // Save OTP to user record
     await this.usersService.updateOtp(user.id, otp);
 
-    // Fetch phone number from Employee table
+    // Fetch employee details
     const employee = (user.empId !== null && user.empId !== undefined)
       ? await this.employeeRepo.findOne({ where: { id: user.empId } })
       : null;
     const phoneNumber = employee?.phonenumber ?? '';
+    const email = employee?.email ?? '';
+    const rawOtpType = String(employee?.otpNotificationType || 'SMS').toUpperCase();
+    const shouldSendEmail = rawOtpType === 'EMAIL' || rawOtpType === 'BOTH' || (rawOtpType.includes('EMAIL') && rawOtpType.includes('SMS'));
+    const shouldSendSms = rawOtpType === 'SMS' || rawOtpType === 'BOTH' || (rawOtpType.includes('EMAIL') && rawOtpType.includes('SMS'));
 
-    // Send OTP via SMS
+    let emailSent = false;
     let smsSent = false;
+    let maskedPhone = '';
+    let maskedEmail = '';
+
     if (phoneNumber) {
-      smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+      maskedPhone = this.maskPhone(phoneNumber);
+    }
+    if (email) {
+      maskedEmail = this.maskEmail(email);
     }
 
-    // Fallback: log OTP to server console
-    if (!smsSent) {
-      console.log(`[OTP - FORGOT PASSWORD] User: ${username} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'}`);
+    if (shouldSendEmail && email) {
+      const html = `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <h2 style="color: #0f172a; margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.5px;">BEAM Platform</h2>
+            <p style="color: #64748b; margin-top: 6px; font-size: 14px;">Password Reset Verification</p>
+          </div>
+          <p style="color: #334155; font-size: 15px; margin-bottom: 12px;">Hello <strong>${employee?.employeeName || user.username}</strong>,</p>
+          <p style="color: #475569; font-size: 14px; line-height: 1.5; margin-bottom: 24px;">Please use the one-time security code below to reset your password:</p>
+          <div style="text-align: center; margin: 28px 0;">
+            <div style="display: inline-block; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #4338ca; background: #eef2ff; padding: 14px 28px; border-radius: 8px; border: 1.5px dashed #6366f1;">
+              ${otp}
+            </div>
+          </div>
+          <p style="color: #64748b; font-size: 13px; line-height: 1.5;">This code will expire in <strong>5 minutes</strong>. If you did not request a password reset, please contact your administrator.</p>
+          <hr style="border: none; border-top: 1px solid #f1f5f9; margin: 24px 0;" />
+          <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">SafeSiteWorks - BEAM System</p>
+        </div>
+      `;
+      emailSent = await this.emailService.sendEmail({
+        to: email,
+        subject: 'BEAM - Password Reset Code',
+        text: `Your BEAM password reset verification code is: ${otp}. It expires in 5 minutes.`,
+        html,
+      });
+      if (!emailSent) {
+        console.log(`[OTP - FORGOT PASSWORD VIA EMAIL] User: ${username} | OTP: ${otp} | Email: ${email || 'N/A'}`);
+      }
     }
 
-    // Mask phone number for display
-    const maskedPhone = phoneNumber
-      ? `****${phoneNumber.replace(/\D/g, '').slice(-4)}`
-      : 'N/A';
+    if (shouldSendSms && phoneNumber) {
+      smsSent = await this.smsService.sendSms(
+        phoneNumber,
+        `Your BEAM password reset code is: ${otp}. Valid for 5 minutes.`,
+      );
+      if (!smsSent) {
+        smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+      }
+      if (!smsSent) {
+        console.log(`[OTP - FORGOT PASSWORD VIA SMS] User: ${username} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'}`);
+      }
+    }
+
+    const isBoth = shouldSendEmail && shouldSendSms;
+    const isEmail = shouldSendEmail && !shouldSendSms;
+    const resolvedOtpType = isBoth ? 'BOTH' : (isEmail ? 'EMAIL' : 'SMS');
+
+    let responseMsg = '';
+    if (isBoth) {
+      responseMsg = `OTP sent to your registered email address (${maskedEmail || 'email'}) and phone number (${maskedPhone || 'phone'}).`;
+    } else if (isEmail) {
+      responseMsg = `OTP sent to your registered email address${maskedEmail ? ` (${maskedEmail})` : ''}.`;
+    } else {
+      responseMsg = `OTP sent to your registered phone number ending in ${maskedPhone || 'N/A'}.`;
+    }
 
     return {
       statusCode: HttpStatus.OK,
-      message: `OTP sent to your registered phone number ending in ${maskedPhone}.`,
+      message: responseMsg,
       user_id: user.id,
+      otpNotificationType: resolvedOtpType,
       maskedPhone,
+      maskedEmail,
       sms_sent: smsSent,
+      email_sent: emailSent,
     };
   }
 
@@ -228,15 +430,9 @@ export class AuthService {
       throw new UnauthorizedException('User not found');
     }
 
-    // Allow static dev OTP bypass
-    const staticOtp = process.env.DEV_STATIC_OTP;
-    const isStaticOtpMatch = staticOtp && otp === staticOtp;
-
-    // Validate OTP
-    if (!isStaticOtpMatch) {
-      if (!user.otp || user.otp !== otp) {
-        throw new UnauthorizedException('Invalid OTP. Please check the code sent to your phone.');
-      }
+    // Strictly verify OTP sent via SMS or Email
+    if (!user.otp || String(user.otp).trim() !== String(otp).trim()) {
+      throw new UnauthorizedException('Invalid OTP. Please enter the verification code sent to your registered email or phone.');
     }
 
     // Clear OTP
@@ -272,33 +468,103 @@ export class AuthService {
     // Save OTP
     await this.usersService.updateOtp(user.id, otp);
 
-    // Fetch phone number from Employee table
-    const employee = (user.empId !== null && user.empId !== undefined)
+    // Fetch phone number, email and notification type from Employee table
+    let employee = (user.empId !== null && user.empId !== undefined)
       ? await this.employeeRepo.findOne({ where: { id: user.empId } })
       : null;
+    if (!employee && user.username) {
+      employee = await this.employeeRepo.findOne({ where: { username: user.username } });
+    }
+
     const phoneNumber = employee?.phonenumber ?? '';
+    const email = employee?.email || (user.username && user.username.includes('@') ? user.username : '');
+    const rawOtpType = String(employee?.otpNotificationType || 'SMS').toUpperCase();
+    const shouldSendEmail = rawOtpType === 'EMAIL' || rawOtpType === 'BOTH' || (rawOtpType.includes('EMAIL') && rawOtpType.includes('SMS'));
+    const shouldSendSms = rawOtpType === 'SMS' || rawOtpType === 'BOTH' || (rawOtpType.includes('EMAIL') && rawOtpType.includes('SMS'));
+
+    let emailSent = false;
+    let smsSent = false;
+    let maskedPhone = '';
+    let maskedEmail = '';
+
+    if (phoneNumber) {
+      maskedPhone = this.maskPhone(phoneNumber);
+    }
+    if (email) {
+      maskedEmail = this.maskEmail(email);
+    }
+
+    // Send OTP via Email
+    if (shouldSendEmail && email) {
+      const html = `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <h2 style="color: #0f172a; margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.5px;">BEAM Platform</h2>
+            <p style="color: #64748b; margin-top: 6px; font-size: 14px;">Change Password Verification</p>
+          </div>
+          <p style="color: #334155; font-size: 15px; margin-bottom: 12px;">Hello <strong>${employee?.employeeName || user.username}</strong>,</p>
+          <p style="color: #475569; font-size: 14px; line-height: 1.5; margin-bottom: 24px;">Please use the one-time security code below to complete your password change:</p>
+          <div style="text-align: center; margin: 28px 0;">
+            <div style="display: inline-block; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #4338ca; background: #eef2ff; padding: 14px 28px; border-radius: 8px; border: 1.5px dashed #6366f1;">
+              ${otp}
+            </div>
+          </div>
+          <p style="color: #64748b; font-size: 13px; line-height: 1.5;">This code will expire in <strong>5 minutes</strong>. If you did not request a password change, please contact your administrator immediately.</p>
+          <hr style="border: none; border-top: 1px solid #f1f5f9; margin: 24px 0;" />
+          <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">SafeSiteWorks - BEAM System</p>
+        </div>
+      `;
+      emailSent = await this.emailService.sendEmail({
+        to: email,
+        subject: 'BEAM - Change Password Verification Code',
+        text: `Your BEAM password change verification code is: ${otp}. It expires in 5 minutes.`,
+        html,
+      });
+      if (!emailSent) {
+        console.log(`[OTP - CHANGE PASSWORD VIA EMAIL] User ID: ${userId} | OTP: ${otp} | Email: ${email || 'N/A'}`);
+      }
+    }
 
     // Send OTP via SMS
-    let smsSent = false;
-    if (phoneNumber) {
-      smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+    if (shouldSendSms && phoneNumber) {
+      smsSent = await this.smsService.sendSms(
+        phoneNumber,
+        `Your BEAM password change verification code is: ${otp}. Valid for 5 minutes.`,
+      );
+      if (!smsSent) {
+        smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+      }
+      if (!smsSent) {
+        console.log(`[OTP - CHANGE PASSWORD VIA SMS] User ID: ${userId} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'}`);
+      }
     }
 
-    // Fallback: log OTP to server console
-    if (!smsSent) {
-      console.log(`[OTP - CHANGE PASSWORD] User ID: ${userId} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'}`);
+    // Fallback: log OTP to server console if nothing was sent
+    if (!smsSent && !emailSent) {
+      console.log(`[OTP - CHANGE PASSWORD] User ID: ${userId} | OTP: ${otp} | Phone: ${phoneNumber || 'N/A'} | Email: ${email || 'N/A'}`);
     }
 
-    // Mask phone number
-    const maskedPhone = phoneNumber
-      ? `****${phoneNumber.replace(/\D/g, '').slice(-4)}`
-      : 'N/A';
+    const isBoth = shouldSendEmail && shouldSendSms;
+    const isEmail = shouldSendEmail && !shouldSendSms;
+    const resolvedOtpType = isBoth ? 'BOTH' : (isEmail ? 'EMAIL' : 'SMS');
+
+    let responseMsg = '';
+    if (isBoth) {
+      responseMsg = `OTP sent to your registered email (${maskedEmail || 'email'}) and phone number (${maskedPhone || 'phone'}).`;
+    } else if (isEmail) {
+      responseMsg = `OTP sent to your registered email address${maskedEmail ? ` (${maskedEmail})` : ''}.`;
+    } else {
+      responseMsg = `OTP sent to your registered phone number${maskedPhone ? ` ending in ${maskedPhone}` : ''}.`;
+    }
 
     return {
       statusCode: HttpStatus.OK,
-      message: `OTP sent to your registered phone number ending in ${maskedPhone}.`,
+      message: responseMsg,
+      otpNotificationType: resolvedOtpType,
       maskedPhone,
+      maskedEmail,
       sms_sent: smsSent,
+      email_sent: emailSent,
     };
   }
 
@@ -314,18 +580,12 @@ export class AuthService {
       throw new UnauthorizedException('User not found');
     }
 
-    // Allow static dev OTP bypass
-    const staticOtp = process.env.DEV_STATIC_OTP;
-    const isStaticOtpMatch = staticOtp && otp === staticOtp;
-
-    // Validate OTP
-    if (!isStaticOtpMatch) {
-      if (!user.otp || user.otp !== otp) {
-        throw new UnauthorizedException('Invalid OTP. Please check the code sent to your phone.');
-      }
+    // Strictly verify OTP sent via SMS or Email
+    if (!user.otp || String(user.otp).trim() !== String(otp).trim()) {
+      throw new UnauthorizedException('Invalid OTP. Please enter the verification code sent to your registered email or phone.');
     }
 
-    // Clear OTP after successful verification
+    // Clear OTP after verification
     await this.usersService.clearOtp(user.id);
 
     // Save new password as base64 for compatibility with legacy system
@@ -333,6 +593,9 @@ export class AuthService {
 
     // Update password
     const updated = await this.usersService.updatePassword(id, base64Password);
+    if (updated && user.empId) {
+      await this.employeeRepo.update(user.empId, { password: base64Password }).catch(() => null);
+    }
 
     if (updated) {
       return {
@@ -399,6 +662,7 @@ export class AuthService {
     };
   }
 
+
   /**
    * SSO Login: Introspect token with Superadmin Auth Service (port 4000)
    */
@@ -458,8 +722,8 @@ export class AuthService {
             targetRegion: decoded.targetRegion,
           };
         }
-      } catch (jwtErr) {
-        console.warn('Direct JWT decode fallback failed:', jwtErr);
+      } catch (jwtErr: any) {
+        console.warn('Local JWT fallback verification error:', jwtErr);
       }
     }
 
@@ -515,6 +779,7 @@ export class AuthService {
       },
       token: access_token,
       access_token: access_token,
+      moduleAccess: 'permit-to-work,incident-management,safety-observations,safety-inspection,spot-checks',
     };
   }
 }

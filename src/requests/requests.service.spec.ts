@@ -11,14 +11,8 @@ describe('RequestsService - Validation and Zone Logic', () => {
   let mockDepartmentRepo: any;
   let mockRequestRepo: any;
 
-  let mockRoomRepo: any;
-
   beforeEach(() => {
     mockZoneRepo = {
-      find: jest.fn(),
-    };
-
-    mockRoomRepo = {
       find: jest.fn(),
     };
 
@@ -70,7 +64,7 @@ describe('RequestsService - Validation and Zone Logic', () => {
       {} as any, // buildingRepo
       {} as any, // floorRepo
       mockZoneRepo, // zoneRepo
-      mockRoomRepo, // roomRepo
+      {} as any, // roomRepo
       {} as any, // subcontractorRepo
       {} as any, // activityRepo
       mockUserRepo, // userRepo
@@ -85,56 +79,58 @@ describe('RequestsService - Validation and Zone Logic', () => {
   });
 
   describe('checkZoneStatusAndAssignPermitUnder', () => {
-    it('should throw BadRequestException if selected rooms are not found', async () => {
-      mockRoomRepo.find.mockResolvedValue([]);
-      const dto: CreateRequestDto = { Room_Nos: '999' };
+    it('should throw BadRequestException if selected zones are not found', async () => {
+      mockZoneRepo.find.mockResolvedValue([]);
+      const dto: CreateRequestDto = { Zone_Id: 999 };
 
       await expect(
         service['checkZoneStatusAndAssignPermitUnder'](dto),
-      ).rejects.toThrow(new BadRequestException('Selected rooms not found'));
+      ).rejects.toThrow(new BadRequestException('Selected zones not found'));
     });
 
-    it('should throw BadRequestException if room status is HO', async () => {
-      mockRoomRepo.find.mockResolvedValue([{ room_id: 1, status: 'HO' }]);
-      const dto: CreateRequestDto = { Room_Nos: '1' };
+    it('should throw BadRequestException if zone status is HO', async () => {
+      mockZoneRepo.find.mockResolvedValue([{ id: 1, status: 'HO' }]);
+      const dto: CreateRequestDto = { Zone_Id: 1 };
 
       await expect(
         service['checkZoneStatusAndAssignPermitUnder'](dto),
       ).rejects.toThrow(
-        new BadRequestException('Cannot create a permit if room status is HO'),
+        new BadRequestException('Cannot create a permit if zone status is HO'),
       );
     });
 
-    it('should throw BadRequestException if selected rooms have mixed statuses', async () => {
-      mockRoomRepo.find.mockResolvedValue([
-        { room_id: 1, status: 'UC' },
-        { room_id: 2, status: 'C' },
+    it('should throw BadRequestException if selected zones have mixed statuses', async () => {
+      mockZoneRepo.find.mockResolvedValue([
+        { id: 1, status: 'UC' },
+        { id: 2, status: 'C' },
       ]);
-      const dto: CreateRequestDto = { Room_Nos: '1,2' };
+      const dto: CreateRequestDto = { Zone_Id: '1,2' };
 
       await expect(
         service['checkZoneStatusAndAssignPermitUnder'](dto),
       ).rejects.toThrow(
         new BadRequestException(
-          'All selected rooms must belong to the same status',
+          'All selected zones must belong to the same status',
         ),
       );
     });
 
-    it('should assign permit_under to Construction if room status is UC', async () => {
-      mockRoomRepo.find.mockResolvedValue([{ room_id: 3, status: 'UC' }]);
-      const dto: CreateRequestDto = { Room_Nos: '3' };
+    it('should assign permit_under to Construction if status is UC', async () => {
+      mockZoneRepo.find.mockResolvedValue([{ id: 3, status: 'UC' }]);
+      const dto: CreateRequestDto = { Zone_Id: 3 };
 
       await service['checkZoneStatusAndAssignPermitUnder'](dto);
       expect(dto.permit_under).toBe('Construction');
+      expect(dto.Zone_Id).toBe('3');
     });
 
-    it('should assign permit_under to Commissioning if room status is C', async () => {
-      mockRoomRepo.find.mockResolvedValue([{ room_id: 4, status: 'C' }]);
-      const dto: CreateRequestDto = { Room_Nos: '4' };
+    it('should assign permit_under to Commissioning if status is C', async () => {
+      mockZoneRepo.find.mockResolvedValue([{ id: 4, status: 'C' }]);
+      const dto: CreateRequestDto = { Zone_Id: 4 };
 
       await service['checkZoneStatusAndAssignPermitUnder'](dto);
       expect(dto.permit_under).toBe('Commissioning');
+      expect(dto.Zone_Id).toBe('4');
     });
 
     it('should ignore zone ID if it is 0 or non-positive', async () => {
@@ -394,7 +390,7 @@ describe('RequestsService - Validation and Zone Logic', () => {
       ).rejects.toThrow(/Cannot change status from terminal state/);
     });
 
-    it('should restrict contractor from approving/pre-approving/rejecting/cancelling', async () => {
+    it('should restrict contractor from approving/pre-approving', async () => {
       mockRequest.requestStatus = 'draft';
       // Contractor (Subcontractor) user
       mockUserRepo.findOne.mockResolvedValue({ id: 2, userType: 'Subcontractor' });
@@ -408,7 +404,7 @@ describe('RequestsService - Validation and Zone Logic', () => {
       ).rejects.toThrow(/Contractor is not authorized/);
     });
 
-    it('should allow contractor to change draft <-> hold, and approved -> opened -> closed', async () => {
+    it('should allow contractor to change draft <-> hold, approved -> opened -> closed, and cancel/reject active permits', async () => {
       mockUserRepo.findOne.mockResolvedValue({ id: 2, userType: 'Subcontractor' });
       
       // draft -> hold (allowed)
@@ -428,6 +424,24 @@ describe('RequestsService - Validation and Zone Logic', () => {
       await expect(
         service['validateStatusTransitionAndRole'](mockRequest, 'closed', 2),
       ).resolves.not.toThrow();
+
+      // approved -> cancelled (allowed)
+      mockRequest.requestStatus = 'approved';
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'cancelled', 2),
+      ).resolves.not.toThrow();
+
+      // draft -> rejected (allowed for contractor)
+      mockRequest.requestStatus = 'draft';
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 2),
+      ).resolves.not.toThrow();
+
+      // approved -> rejected (restricted for contractor, allowed only for final approving dept/admin)
+      mockRequest.requestStatus = 'approved';
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 2),
+      ).rejects.toThrow(/Contractor is not authorized/);
     });
 
     it('should validate department specific pre-approval and final approval rules', async () => {
@@ -512,6 +526,100 @@ describe('RequestsService - Validation and Zone Logic', () => {
       await expect(
         service['validateStatusTransitionAndRole'](mockRequest, 'approved', 4), // C&Q
       ).rejects.toThrow(/Final approval for Construction under Commissioning permits must be done by a ConM/);
+    });
+
+    it('should validate rejection rules according to BEAM Rejection Flow chart', async () => {
+      mockUserRepo.findOne.mockImplementation(async (query: any) => {
+        if (query.where.id === 3) return { id: 3, userType: 'Department', empId: 10 };
+        if (query.where.id === 4) return { id: 4, userType: 'Department', empId: 11 };
+        return null;
+      });
+
+      mockEmployeeRepo.findOne.mockImplementation(async (query: any) => {
+        if (query.where.id === 10) return { id: 10, departId: 5 };
+        if (query.where.id === 11) return { id: 11, departId: 6 };
+        return null;
+      });
+
+      mockDepartmentRepo.findOne.mockImplementation(async (query: any) => {
+        if (query.where.id === 5) return { id: 5, departmentName: 'CoNM Dept' };
+        if (query.where.id === 6) return { id: 6, departmentName: 'C&Q Dept' };
+        return null;
+      });
+
+      // 1. Pure Construction: ConM can reject at Hold & Approved, C&Q cannot
+      mockRequest.permitUnder = 'Construction';
+      mockRequest.permitType = 'Construction';
+      mockRequest.requestStatus = 'hold';
+
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 3), // ConM
+      ).resolves.not.toThrow();
+
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 4), // C&Q
+      ).rejects.toThrow(/Rejection for Construction-only permits must be done by a ConM/);
+
+      mockRequest.requestStatus = 'approved';
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 3), // ConM
+      ).resolves.not.toThrow();
+
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 4), // C&Q
+      ).rejects.toThrow(/Rejection for Construction-only permits must be done by a ConM/);
+
+      // 2. Pure Commissioning: C&Q can reject at Hold & Approved, ConM cannot
+      mockRequest.permitUnder = 'Commissioning';
+      mockRequest.permitType = 'Commissioning';
+      mockRequest.requestStatus = 'hold';
+
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 4), // C&Q
+      ).resolves.not.toThrow();
+
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 3), // ConM
+      ).rejects.toThrow(/Rejection for Commissioning-only permits must be done by a C&Q/);
+
+      mockRequest.requestStatus = 'approved';
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 4), // C&Q
+      ).resolves.not.toThrow();
+
+      await expect(
+        service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 3), // ConM
+      ).rejects.toThrow(/Rejection for Commissioning-only permits must be done by a C&Q/);
+
+      // 3. Mixed: Construction Under Commissioning: Both ConM & C&Q can reject at Hold, Pre-Approved, Approved
+      mockRequest.permitUnder = 'Commissioning';
+      mockRequest.permitType = 'Construction';
+
+      for (const st of ['hold', 'pre-approved', 'approved']) {
+        mockRequest.requestStatus = st;
+        await expect(
+          service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 3), // ConM
+        ).resolves.not.toThrow();
+
+        await expect(
+          service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 4), // C&Q
+        ).resolves.not.toThrow();
+      }
+
+      // 4. Mixed: Commissioning Under Construction: Both ConM & C&Q can reject at Hold, Pre-Approved, Approved
+      mockRequest.permitUnder = 'Construction';
+      mockRequest.permitType = 'Commissioning';
+
+      for (const st of ['hold', 'pre-approved', 'approved']) {
+        mockRequest.requestStatus = st;
+        await expect(
+          service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 3), // ConM
+        ).resolves.not.toThrow();
+
+        await expect(
+          service['validateStatusTransitionAndRole'](mockRequest, 'rejected', 4), // C&Q
+        ).resolves.not.toThrow();
+      }
     });
   });
 });

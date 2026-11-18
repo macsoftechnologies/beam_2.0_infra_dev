@@ -12,17 +12,7 @@ export class RoomController {
       const rooms = await this.roomService.findAll(query);
       return rooms;
     } catch (error) {
-      console.error('Error retrieving rooms:', error);
-      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: error.message || 'Error retrieving rooms', error: error.stack };
-    }
-  }
-
-  @Get('status/counts')
-  async getStatusCounts() {
-    try {
-      return await this.roomService.getStatusCounts();
-    } catch (error) {
-      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Error retrieving status counts' };
+      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Error retrieving rooms' };
     }
   }
 

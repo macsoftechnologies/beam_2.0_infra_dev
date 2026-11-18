@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, Brackets, DeepPartial } from 'typeorm';
@@ -52,7 +52,7 @@ import { CreateByCountDto } from './dtos/create-by-count.dto';
 import { PlanSearchDto } from './dtos/planssearch.dto';
 
 @Injectable()
-export class RequestsService {
+export class RequestsService implements OnModuleInit {
   constructor(
     @InjectRepository(RequestEntity)
     private readonly requestRepo: Repository<RequestEntity>,
@@ -121,6 +121,26 @@ export class RequestsService {
     private readonly notificationsService: NotificationsService,
   ) { }
 
+  async onModuleInit() {
+    try {
+      await this.requestRepo.query('ALTER TABLE requests MODIFY COLUMN Floor_Id VARCHAR(255) NULL');
+    } catch (err) {
+      // Ignored if column already modified or table not ready
+    }
+    try {
+      const cols: any[] = await this.requestRepo.query(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'request_extra_misc' AND COLUMN_NAME = 'close_reason'`,
+      );
+      if (!cols || cols.length === 0) {
+        await this.requestRepo.query(
+          'ALTER TABLE request_extra_misc ADD COLUMN close_reason TEXT NULL',
+        );
+      }
+    } catch (err) {
+      // Ignored if column already exists or table not ready
+    }
+  }
+
   private areEqual(val1: any, val2: any): boolean {
     if (val1 === val2) return true;
     const isEmpty = (v: any) =>
@@ -155,26 +175,134 @@ export class RequestsService {
     return String(val1).trim() === String(val2).trim();
   }
 
-  async getSubcontractorIdForUser(userId?: number): Promise<number | null> {
-    if (!userId) return null;
-    const user = await this.userRepo.findOne({ where: { id: userId } });
-    if (user && user.userType === 'Subcontractor') {
-      return user.typeId;
+  async resolveUserScope(loggedInUserId?: number, activeUserTypeHeader?: string): Promise<{
+    isAll: boolean;
+    subContractorId: number | null;
+    limitToUserId: number | null;
+    role: string;
+  }> {
+    if (!loggedInUserId) {
+      return { isAll: true, subContractorId: null, limitToUserId: null, role: 'guest' };
     }
-    return null;
+
+    const user = await this.userRepo.findOne({ where: { id: loggedInUserId } });
+    if (!user) {
+      return { isAll: true, subContractorId: null, limitToUserId: null, role: 'unknown' };
+    }
+
+    const employee = user.empId ? await this.employeeRepo.findOne({ where: { id: user.empId } }) : null;
+
+    // 1. Check activeUserTypeHeader if supplied (from frontend localStorage UserType)
+    const activeHeader = (activeUserTypeHeader || '').trim().toLowerCase();
+    if (activeHeader) {
+      if (activeHeader.includes('admin') || activeHeader.includes('superadmin')) {
+        return { isAll: true, subContractorId: null, limitToUserId: null, role: 'admin' };
+      }
+      if (
+        activeHeader.includes('department') ||
+        activeHeader.includes('conm') ||
+        activeHeader.includes('c&q') ||
+        activeHeader.includes('hse')
+      ) {
+        return { isAll: true, subContractorId: null, limitToUserId: null, role: 'department' };
+      }
+      if (activeHeader.includes('contractor') || activeHeader.includes('subcontractor')) {
+        const scId = employee?.subContId || user.typeId || null;
+        return { isAll: false, subContractorId: scId, limitToUserId: scId ? null : user.id, role: 'contractor' };
+      }
+      if (activeHeader.includes('observer')) {
+        return { isAll: true, subContractorId: null, limitToUserId: null, role: 'observer' };
+      }
+    }
+
+    // 2. Check employee.moduleAccess specifically for 'permit-to-work'
+    const rawModuleAccess = employee?.moduleAccess || (employee as any)?.module_access;
+    if (rawModuleAccess) {
+      const modules = String(rawModuleAccess).split(',').map((m: string) => m.trim());
+      for (const mod of modules) {
+        const [modName, modRole] = mod.split(':').map((s: string) => s.trim().toLowerCase());
+        if (modName === 'permit-to-work' || modName === 'permit_to_work' || modName === 'ptw') {
+          if (modRole) {
+            if (modRole.includes('contractor') || modRole.includes('subcontractor')) {
+              const scId = employee?.subContId || user.typeId || null;
+              return { isAll: false, subContractorId: scId, limitToUserId: scId ? null : user.id, role: 'contractor' };
+            }
+            if (
+              modRole.includes('department') ||
+              modRole.includes('conm') ||
+              modRole.includes('c&q') ||
+              modRole.includes('hse')
+            ) {
+              return { isAll: true, subContractorId: null, limitToUserId: null, role: 'department' };
+            }
+            if (modRole.includes('admin')) {
+              return { isAll: true, subContractorId: null, limitToUserId: null, role: 'admin' };
+            }
+            if (modRole.includes('observer')) {
+              return { isAll: true, subContractorId: null, limitToUserId: null, role: 'observer' };
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Check employee relation
+    if (employee?.subContId && !employee?.departId) {
+      return { isAll: false, subContractorId: employee.subContId, limitToUserId: null, role: 'contractor' };
+    }
+    if (employee?.departId) {
+      return { isAll: true, subContractorId: null, limitToUserId: null, role: 'department' };
+    }
+
+    // 4. Check user.userType comma-separated values
+    const userTypes = (user.userType || '')
+      .split(',')
+      .map((t: string) => t.trim().toLowerCase())
+      .filter(Boolean);
+
+    if (userTypes.some((t: string) => t.includes('admin') || t.includes('superadmin'))) {
+      return { isAll: true, subContractorId: null, limitToUserId: null, role: 'admin' };
+    }
+    if (userTypes.some((t: string) => t.includes('observer'))) {
+      return { isAll: true, subContractorId: null, limitToUserId: null, role: 'observer' };
+    }
+    if (userTypes.some((t: string) => t.includes('department') || t.includes('department1') || t.includes('hse'))) {
+      return { isAll: true, subContractorId: null, limitToUserId: null, role: 'department' };
+    }
+    if (userTypes.some((t: string) => t.includes('subcontractor') || t.includes('contractor'))) {
+      const scId = employee?.subContId || user.typeId || null;
+      return { isAll: false, subContractorId: scId, limitToUserId: scId ? null : user.id, role: 'contractor' };
+    }
+
+    return { isAll: false, subContractorId: null, limitToUserId: user.id, role: 'user' };
+  }
+
+  async getSubcontractorIdForUser(userId?: number, activeUserType?: string): Promise<number | null> {
+    const scope = await this.resolveUserScope(userId, activeUserType);
+    return scope.subContractorId;
   }
 
   private async validateStatusTransitionAndRole(
     existing: RequestEntity,
     newStatus: string,
     actorUserId: number,
+    activeUserType?: string,
   ): Promise<void> {
     if (!actorUserId) {
       throw new BadRequestException('Actor userId is required for status updates');
     }
+    const activeHeader = (activeUserType || '').toLowerCase().trim();
+    if (activeHeader.includes('observer')) {
+      throw new BadRequestException('Observer access is not authorized to change permit status');
+    }
     const user = await this.userRepo.findOne({ where: { id: actorUserId } });
     if (!user) {
       throw new BadRequestException(`User not found for ID: ${actorUserId}`);
+    }
+
+    const scope = await this.resolveUserScope(actorUserId, activeUserType);
+    if (scope.role === 'observer') {
+      throw new BadRequestException('Observer access is not authorized to change permit status');
     }
 
     let role = 'observer';
@@ -187,9 +315,15 @@ export class RequestsService {
       .map((t) => t.trim())
       .filter(Boolean);
 
+    const isDeptUser = userTypes.includes('Department');
+    const isDept1User = userTypes.includes('Department1');
+    const isMultiDept = isDeptUser && isDept1User;
+
     if (userTypes.includes('Admin') || userTypes.includes('SuperAdmin')) {
       role = 'admin';
-    } else if (userTypes.includes('Department') || userTypes.includes('Department1')) {
+    } else if (isMultiDept) {
+      role = 'multi_dept';
+    } else if (isDeptUser || isDept1User) {
       // Department  = CONM (Construction Management / first-approval stream)
       // Department1 = C&Q  (Commissioning / second-approval stream)
       // Try to resolve the exact stream via the employee's department name first
@@ -206,10 +340,10 @@ export class RequestsService {
                 role = 'C&Q';
               } else {
                 // Generic department – default based on userType flag
-                role = userTypes.includes('Department1') ? 'C&Q' : 'CoNM';
+                role = isDept1User ? 'C&Q' : 'CoNM';
               }
             } else {
-              role = userTypes.includes('Department1') ? 'C&Q' : 'CoNM';
+              role = isDept1User ? 'C&Q' : 'CoNM';
             }
           } else if (employee.subContId) {
             role = 'contractor';
@@ -217,15 +351,15 @@ export class RequestsService {
             role = 'observer';
           } else {
             // Employee exists but no departId/subContId/obserId — treat by userType
-            role = userTypes.includes('Department1') ? 'C&Q' : 'CoNM';
+            role = isDept1User ? 'C&Q' : 'CoNM';
           }
         } else {
           // No employee record found – fall back to userType
-          role = userTypes.includes('Department1') ? 'C&Q' : 'CoNM';
+          role = isDept1User ? 'C&Q' : 'CoNM';
         }
       } else {
         // No empId on user – use userType directly
-        role = userTypes.includes('Department1') ? 'C&Q' : 'CoNM';
+        role = isDept1User ? 'C&Q' : 'CoNM';
       }
     } else if (userTypes.includes('Subcontractor')) {
       role = 'contractor';
@@ -266,31 +400,39 @@ export class RequestsService {
       );
     }
 
-    // Reversion check (except hold -> draft)
+    // Reversion check (except hold -> draft or terminal actions like cancel / reject)
     const isHoldToDraft = (normalizedCurrent === 'hold' && normalizedNew === 'draft');
-    if (newLevel < currentLevel && !isHoldToDraft) {
+    const isTerminalAction = (normalizedNew === 'cancelled' || normalizedNew === 'rejected');
+    if (newLevel < currentLevel && !isHoldToDraft && !isTerminalAction) {
       throw new BadRequestException(
         `Status cannot be reverted from '${existing.requestStatus}' to '${newStatus}'`
       );
     }
 
     // Role-based restrictions
-    if (role === 'admin' || role === 'CoNM' || role === 'C&Q') {
+    if (role === 'admin' || role === 'multi_dept' || role === 'CoNM' || role === 'C&Q') {
       // Authorized departments/admin can transition
     } else if (role === 'contractor') {
-      // Contractor can only change status:
+      // Contractor can change status:
       // - between draft and hold (levels 1 & 2)
+      // - draft/hold -> rejected
       // - approved -> opened (level 4 -> 5)
       // - opened -> closed (level 5 -> 6)
+      // - active status -> cancelled
       const allowedContractorTransitions = [
         ['draft', 'hold'],
         ['hold', 'draft'],
+        ['draft', 'rejected'],
+        ['hold', 'rejected'],
         ['approved', 'opened'],
         ['opened', 'closed'],
       ];
-      const isAllowed = allowedContractorTransitions.some(
-        ([from, to]) => normalizedCurrent === from && normalizedNew === to
-      );
+      const isAllowed =
+        allowedContractorTransitions.some(
+          ([from, to]) => normalizedCurrent === from && normalizedNew === to
+        ) ||
+        normalizedNew === 'cancelled';
+
       if (!isAllowed) {
         throw new BadRequestException(
           `Contractor is not authorized to transition permit status from '${existing.requestStatus}' to '${newStatus}'`
@@ -319,7 +461,7 @@ export class RequestsService {
         );
       }
 
-      if (role !== 'admin') {
+      if (role !== 'admin' && role !== 'multi_dept') {
         if (isUnderConstTypeComm && role !== 'C&Q') {
           throw new BadRequestException('Pre-approval for Construction under Commissioning must be done by a C&Q department user');
         }
@@ -338,7 +480,7 @@ export class RequestsService {
         }
       }
 
-      if (role !== 'admin') {
+      if (role !== 'admin' && role !== 'multi_dept') {
         if (isBothConstruction && role !== 'CoNM') {
           throw new BadRequestException('Final approval for Construction-only permits must be done by a ConM department user');
         }
@@ -356,27 +498,64 @@ export class RequestsService {
 
     // Rule C: Transition to rejected
     if (normalizedNew === 'rejected') {
-      if (role !== 'admin') {
-        if (normalizedCurrent === 'draft' || normalizedCurrent === 'hold') {
-          if (isBothConstruction && role !== 'CoNM') {
+      const allowedRejectionStatuses = ['draft', 'hold', 'pre-approved', 'approved'];
+      if (!allowedRejectionStatuses.includes(normalizedCurrent)) {
+        throw new BadRequestException(
+          `Permits in '${existing.requestStatus}' status cannot be rejected`
+        );
+      }
+
+      if (role !== 'admin' && role !== 'multi_dept') {
+        if (role === 'contractor') {
+          if (normalizedCurrent !== 'draft' && normalizedCurrent !== 'hold') {
+            throw new BadRequestException(
+              `Contractor is not authorized to reject permits in '${existing.requestStatus}' status`
+            );
+          }
+        } else if (isBothConstruction) {
+          if (normalizedCurrent === 'pre-approved') {
+            throw new BadRequestException('Pre-approved status is not applicable for Construction-only permits');
+          }
+          if (role !== 'CoNM') {
             throw new BadRequestException('Rejection for Construction-only permits must be done by a ConM department user');
           }
-          if (isBothCommissioning && role !== 'C&Q') {
+        } else if (isBothCommissioning) {
+          if (normalizedCurrent === 'pre-approved') {
+            throw new BadRequestException('Pre-approved status is not applicable for Commissioning-only permits');
+          }
+          if (role !== 'C&Q') {
             throw new BadRequestException('Rejection for Commissioning-only permits must be done by a C&Q department user');
           }
-          if (isUnderConstTypeComm && role !== 'C&Q') {
-            throw new BadRequestException('Rejection at pre-approval stage for Construction under Commissioning must be done by a C&Q department user');
+        } else if (isUnderConstTypeComm || isUnderCommTypeConst) {
+          // Mixed status: permit_under/permit_type are Construction and Commissioning
+          // Both CoNM (Department) and C&Q (Department1) users can reject at Hold, Pre-Approved, and Approved
+          if (role !== 'CoNM' && role !== 'C&Q') {
+            throw new BadRequestException('Rejection for this permit must be done by a ConM or C&Q department user');
           }
-          if (isUnderCommTypeConst && role !== 'CoNM') {
-            throw new BadRequestException('Rejection at pre-approval stage for Commissioning under Construction must be done by a ConM department user');
-          }
-        } else if (normalizedCurrent === 'pre-approved') {
-          if (isUnderConstTypeComm && role !== 'CoNM') {
-            throw new BadRequestException('Final rejection for Construction under Commissioning permits must be done by a ConM department user');
-          }
-          if (isUnderCommTypeConst && role !== 'C&Q') {
-            throw new BadRequestException('Final rejection for Commissioning under Construction permits must be done by a C&Q department user');
-          }
+        }
+      }
+    }
+
+    // Rule D: Transition to opened
+    if (normalizedNew === 'opened') {
+      if (role !== 'admin' && role !== 'multi_dept' && role !== 'contractor') {
+        if (isBothConstruction && role !== 'CoNM') {
+          throw new BadRequestException('Opening Construction-only permits must be done by a ConM department user');
+        }
+        if (isBothCommissioning && role !== 'C&Q') {
+          throw new BadRequestException('Opening Commissioning-only permits must be done by a C&Q department user');
+        }
+      }
+    }
+
+    // Rule E: Transition to closed
+    if (normalizedNew === 'closed') {
+      if (role !== 'admin' && role !== 'multi_dept' && role !== 'contractor') {
+        if (isBothConstruction && role !== 'CoNM') {
+          throw new BadRequestException('Closing Construction-only permits must be done by a ConM department user');
+        }
+        if (isBothCommissioning && role !== 'C&Q') {
+          throw new BadRequestException('Closing Commissioning-only permits must be done by a C&Q department user');
         }
       }
     }
@@ -453,7 +632,6 @@ export class RequestsService {
     this.validateMandatoryFields(dto);
 
     const permitNo = await this.generatePermitNo();
-
     const isNightShift = String(dto.night_shift) === '1' || String(dto.night_shift) === 'true';
     const computedNextDate = (dto.Working_Date && this.getNextDateString(dto.Working_Date)) || '';
 
@@ -476,7 +654,7 @@ export class RequestsService {
       assignStartDate: dto.Assign_Start_Date,
       assignEndDate: dto.Assign_End_Date,
       buildingId: dto.Building_Id,
-      floorId: dto.Floor_Id,
+      floorId: dto.Floor_Id !== undefined && dto.Floor_Id !== null ? String(dto.Floor_Id) : undefined,
       plansId: dto.Plans_Id,
       zoneId: Array.isArray(dto.Zone_Id)
         ? dto.Zone_Id.join(',')
@@ -502,9 +680,312 @@ export class RequestsService {
       safetyPrecautions: dto.Safety_Precautions,
     };
 
-    const requestObj = this.requestRepo.create(requestData);
-    const savedRequest = await this.requestRepo.save(requestObj);
-    const requestId = savedRequest.id;
+    const savedRequest = await this.requestRepo.manager.transaction(async (manager) => {
+      const requestObj = manager.create(RequestEntity, requestData);
+      const saved = await manager.save(requestObj);
+      const requestId = saved.id;
+
+      // 2. Insert into all 13 sub-tables
+      await manager.save(
+        manager.create(RequestChemicalHazard, {
+          requestId,
+          workingHazardiousSubsten: dto.working_hazardious_substen || 0,
+          relevantMal: dto.relevant_mal || 0,
+          msds: dto.msds || 0,
+          equipmentTakenAccount: dto.equipment_taken_account || 0,
+          ventilation: dto.ventilation || 0,
+          hazardousSubstances: dto.hazardous_substances || 0,
+          storageAndDisposal: dto.storage_and_disposal || 0,
+          reachableCase: dto.reachable_case || 0,
+          checicalRiskAssessment: dto.checical_risk_assessment || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestConfined, {
+          requestId,
+          workingConfinedSpaces: dto.working_confined_spaces || 0,
+          vapoursGases: dto.vapours_gases || 0,
+          lelMeasurement: dto.lel_measurement || 0,
+          allEquipment: dto.all_equipment || 0,
+          exitConditions: dto.exit_conditions || 0,
+          communicationEmergency: dto.communication_emergency || 0,
+          rescueEquipments: dto.rescue_equipments || 0,
+          spaceVentilation: dto.space_ventilation || 0,
+          oxygenMeter: dto.oxygen_meter || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestElectrical, {
+          requestId,
+          workingOnElectricalSystem: dto.working_on_electrical_system || 0,
+          responsibleForTheInformed: dto.responsible_for_the_informed || 0,
+          deEnergized: dto.de_energized || 0,
+          ifNotLoto: dto.if_not_loto || 0,
+          doRiskAssessment: dto.do_risk_assessment || 0,
+          electricityHaveIsulation: dto.electricity_have_isulation || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestEnergisingElectrical, {
+          requestId,
+          powerOn: dto.power_on || 0,
+          energisingEquipment: dto.energising_equipment || 0,
+          isolatingLive: dto.isolating_live || 0,
+          workingNearLive: dto.working_near_live || 0,
+          responsibleForTheArea: dto.responsible_for_the_area || '',
+          riskAssessmentDone: dto.risk_assessment_done || 0,
+          barriersSignage: dto.barriers_signage || 0,
+          arcFlash: dto.arc_flash || 0,
+          energizedBeenTested: dto.energized_been_tested || 0,
+          punchesBeenClosed: dto.punches_been_closed || 0,
+          toctChecklist: dto.toct_checklist || 0,
+          informedAligned: dto.informed_aligned || 0,
+          isolatingResponsible:
+            dto.isolating_responsible !== undefined
+              ? dto.isolating_responsible
+              : dto.isolating_resposible || 0,
+          isolatingRiskAssessment: dto.isolating_risk_assessment || 0,
+          cqInformed: dto.cq_informed || 0,
+          cqProvided: dto.cq_provided || 0,
+          deEnergisationRequest: dto.de_energisation_request || 0,
+          ppePrepared: dto.ppe_prepared || 0,
+          absenceOfVoltage: dto.absence_of_voltage || 0,
+          storedEnergy: dto.stored_energy || 0,
+          backupPower: dto.backup_power || 0,
+          unavoidable: dto.unavoidable || 0,
+          reasonablyPracticable: dto.reasonably_practicable || 0,
+          workAuthorised: dto.work_authorised || 0,
+          workingRiskAssessment: dto.working_risk_assessment || 0,
+          workingArcBoundary: dto.working_arc_boundary || 0,
+          workingBarriers: dto.working_barriers || 0,
+          insulatedTools: dto.insulated_tools || 0,
+          eventOfEmergency: dto.event_of_emergency || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestEnergisingMechanical, {
+          requestId,
+          pressurization: dto.pressurization || 0,
+          performedApproved: dto.performed_approved || 0,
+          flushingApproved: dto.flushing_approved || 0,
+          mcApproved: dto.mc_approved || 0,
+          visualInspection: dto.visual_inspection || 0,
+          lotoPlanApproved: dto.loto_plan_approved || 0,
+          followMediaCode: dto.follow_media_code || 0,
+          cqSafetySigns: dto.cq_safety_signs || 0,
+          mcNumberText: dto.mc_number_text || '',
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestExcavation, {
+          requestId,
+          excavationShoring: dto.excavation_shoring || 0,
+          excavationSegregated: dto.excavation_segregated || 0,
+          nnStandards: dto.nn_standards || 0,
+          danishRegulation: dto.danish_regulation || 0,
+          safeAccessAndEgress: dto.safe_access_and_egress || 0,
+          correctlySloped: dto.correctly_sloped || 0,
+          inspectionDates: dto.inspection_dates || 0,
+          markedDrawings: dto.marked_drawings || 0,
+          undergroundAreasCleared: dto.underground_areas_cleared || 0,
+          excavationWorks: dto.excavation_works || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestExtraMisc, {
+          requestId,
+          tools: dto.Tools || dto.tools || '',
+          machinery: dto.Machinery || dto.machinery || '',
+          descriptionOfActivity: dto.description_of_activity || '',
+          mechanicalWorks: dto.mechanical_works || '',
+          electricalWorks: dto.electrical_works || '',
+          conMInitials: dto.ConM_initials || '',
+          conMInitials1: dto.ConM_initials1 || '',
+          coMMInitials: dto.CoMM_initials || '',
+          rejectReason: dto.reject_reason || '',
+          cancelReason: dto.cancel_reason || '',
+          closeNote: dto.close_note || '',
+          closeReason: dto.close_reason || '',
+          newSubContractor: dto.new_sub_contractor || '',
+          workType: dto.work_type || '',
+          ramsNumber: dto.rams_number,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestFireHotwork, {
+          requestId,
+          hotWork: dto.Hot_work || 0,
+          fireWatchEstablish: dto.fire_watch_establish || 0,
+          combustibleMaterial: dto.combustible_material || 0,
+          safetyMeasures: dto.safety_measures || 0,
+          extinguishersAndFireBlanket: dto.extinguishers_and_fire_blanket || 0,
+          weldingActivity:
+            dto.welding_activity !== undefined
+              ? dto.welding_activity
+              : dto.welding_activitiy || 0,
+          heatTreatment: dto.heat_treatment || 0,
+          airExtractionBeEstablished: dto.air_extraction_be_established || 0,
+          nameOfTheFireWatcher: dto.name_of_the_fire_watcher || '',
+          phoneNumberOfTheFireWatcher: dto.phone_number_of_the_fire_watcher || '',
+          fireGuardPresent: dto.fire_guard_present || '',
+          lowRiskHotwork: dto.low_risk_hotwork || '',
+          highRiskHotwork: dto.high_risk_hotwork || '',
+          hotWorkChecklistFilled: dto.hot_work_checklist_filled || '',
+          hHeatSource: dto.h_heat_source || '',
+          hWorkplaceCheck: dto.h_workplace_check || '',
+          hFireDetectors: dto.h_fire_detectors || '',
+          hStartTime: dto.h_start_time || '',
+          hEndTime: dto.h_end_time || '',
+          fireImage: dto.fire_image || '',
+          tasksInProgressInTheArea: dto.tasks_in_progress_in_the_area || 0,
+          accountDuringTheWork: dto.account_during_the_work || 0,
+          lightingSufficiently: dto.lighting_sufficiently || 0,
+          specificRisksBasedOnTask: dto.specific_risks_based_on_task || 0,
+          workEnvironmentSafetyEnsured: dto.work_environment_safety_ensured || 0,
+          courseOfActionInEmergencies: dto.course_of_action_in_emergencies || 0,
+          ifNoLoto: dto.if_no_loto,
+          hazardausSubstances: dto.hazardaus_substances,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestGeneral, {
+          requestId,
+          affectingOtherContractors: dto.affecting_other_contractors || 0,
+          otherConditions: dto.other_conditions || 0,
+          otherConditionsInput: dto.other_conditions_input || '',
+          lightingBeginWork: dto.lighting_begin_work || 0,
+          specificRisks: dto.specific_risks || 0,
+          environmentEnsured: dto.environment_ensured || 0,
+          courseOfActions:
+            dto.course_of_actions !== undefined
+              ? dto.course_of_actions
+              : dto.course_of_action || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestHeight, {
+          requestId,
+          workingAtHeight: dto.working_at_height || 0,
+          segragatedDemarkated: dto.segragated_demarkated || 0,
+          lanyardAttachments: dto.lanyard_attachments || 0,
+          rescuePlan: dto.rescue_plan || 0,
+          avoidHazards: dto.avoid_hazards || 0,
+          heightTraining: dto.height_training || 0,
+          heightEquipments: dto.height_equipments || 0,
+          supervision: dto.supervision || 0,
+          shockAbsorbing: dto.shock_absorbing || 0,
+          verticalLife: dto.vertical_life || 0,
+          securedFalling: dto.secured_falling || 0,
+          droppedObjects: dto.dropped_objects || 0,
+          safeAcces: dto.safe_acces || 0,
+          weatherAcceptable: dto.weather_acceptable || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestLifting, {
+          requestId,
+          usingCranesOrLifting: dto.using_cranes_or_lifting || 0,
+          appointedPerson: dto.appointed_person || 0,
+          vendorSupplies: dto.vendor_supplies || 0,
+          liftPlan: dto.lift_plan || 0,
+          suppliedAndInspected: dto.supplied_and_inspected || 0,
+          legalRequiredCertificates: dto.legal_required_certificates || 0,
+          praparedLifting: dto.prapared_lifting || 0,
+          liftingTaskFenced: dto.lifting_task_fenced || 0,
+          overheadRisks: dto.overhead_risks || 0,
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestPpe, {
+          requestId,
+          specificGloves: dto.specific_gloves || 0,
+          eyeProtection: dto.eye_protection || 0,
+          fallProtection: dto.fall_protection || 0,
+          hearingProtection: dto.hearing_protection || 0,
+          respiratoryProtection: dto.respiratory_protection || 0,
+          otherPpe: dto.other_ppe || '',
+        }),
+      );
+
+      await manager.save(
+        manager.create(RequestPressureTesting, {
+          requestId,
+          pressureTestingOfEquipment: dto.pressure_testing_of_equipment || 0,
+          lineWalk: dto.line_walk || 0,
+          pressureTestCoordinated: dto.pressure_test_coordinated || 0,
+          pipeworkMic: dto.pipework_mic || 0,
+          lotoPlanAttached: dto.loto_plan_attached || 0,
+          exclusionZoneCalculated: dto.exclusion_zone_calculated || 0,
+          pnematicHydrostatic:
+            dto.pnematic_hydrostatic !== undefined
+              ? dto.pnematic_hydrostatic
+              : dto.pneumatic_hydrostatic || 0,
+          pressureOfTheTest: dto.pressure_of_the_test || '',
+          safetyValvesCalibrated: dto.safety_valves_calibrated || 0,
+          pressurePneumatic: dto.pressure_pneumatic || '',
+          pressureHydrostatic: dto.pressure_hydrostatic || '',
+        }),
+      );
+
+      // 3. Save files
+      if (files && files.length > 0) {
+        for (const file of files) {
+          await manager.insert(RamsFile, {
+            requestId,
+            ramsFile: file.path.replace(/\\/g, '/'),
+            status: 1,
+            createdAt: new Date(),
+            userId: dto.userId || 0,
+          });
+        }
+      }
+
+      // 4. Create logs
+      const logEntry = manager.create(RequestLog, {
+        requestId,
+        userId: dto.userId || 0,
+        requestType: dto.Request_status || 'Pending',
+        createdTime: new Date(),
+        permitNo,
+        system: 0,
+      });
+      await manager.save(logEntry);
+
+      // 5. Add note if provided in create DTO
+      if (dto.notes && dto.notes.trim() !== '') {
+        let noteUsername = 'System';
+        if (dto.userId) {
+          const user = await this.userRepo.findOne({ where: { id: dto.userId } });
+          if (user && user.username) {
+            noteUsername = user.username;
+          }
+        }
+
+        await manager.save(
+          manager.create(RequestNote, {
+            requestId,
+            permitNo,
+            userId: dto.userId || 0,
+            username: noteUsername,
+            note: dto.notes,
+            createdTime: new Date(),
+          }),
+        );
+      }
+
+      return saved;
+    });
 
     if (savedRequest.requestStatus) {
       this.notificationsService.triggerNotification(
@@ -515,309 +996,12 @@ export class RequestsService {
       ).catch((err) => console.error('Notification error:', err));
     }
 
-    // 2. Insert into all 13 sub-tables
-    await this.chemicalRepo.save(
-      this.chemicalRepo.create({
-        requestId,
-        workingHazardiousSubsten: dto.working_hazardious_substen || 0,
-        relevantMal: dto.relevant_mal || 0,
-        msds: dto.msds || 0,
-        equipmentTakenAccount: dto.equipment_taken_account || 0,
-        ventilation: dto.ventilation || 0,
-        hazardousSubstances: dto.hazardous_substances || 0,
-        storageAndDisposal: dto.storage_and_disposal || 0,
-        reachableCase: dto.reachable_case || 0,
-        checicalRiskAssessment: dto.checical_risk_assessment || 0,
-      }),
-    );
-
-    await this.confinedRepo.save(
-      this.confinedRepo.create({
-        requestId,
-        workingConfinedSpaces: dto.working_confined_spaces || 0,
-        vapoursGases: dto.vapours_gases || 0,
-        lelMeasurement: dto.lel_measurement || 0,
-        allEquipment: dto.all_equipment || 0,
-        exitConditions: dto.exit_conditions || 0,
-        communicationEmergency: dto.communication_emergency || 0,
-        rescueEquipments: dto.rescue_equipments || 0,
-        spaceVentilation: dto.space_ventilation || 0,
-        oxygenMeter: dto.oxygen_meter || 0,
-      }),
-    );
-
-    await this.electricalRepo.save(
-      this.electricalRepo.create({
-        requestId,
-        workingOnElectricalSystem: dto.working_on_electrical_system || 0,
-        responsibleForTheInformed: dto.responsible_for_the_informed || 0,
-        deEnergized: dto.de_energized || 0,
-        ifNotLoto: dto.if_not_loto || 0,
-        doRiskAssessment: dto.do_risk_assessment || 0,
-        electricityHaveIsulation: dto.electricity_have_isulation || 0,
-      }),
-    );
-
-    await this.energisingElecRepo.save(
-      this.energisingElecRepo.create({
-        requestId,
-        powerOn: dto.power_on || 0,
-        energisingEquipment: dto.energising_equipment || 0,
-        isolatingLive: dto.isolating_live || 0,
-        workingNearLive: dto.working_near_live || 0,
-        responsibleForTheArea: dto.responsible_for_the_area || '',
-        riskAssessmentDone: dto.risk_assessment_done || 0,
-        barriersSignage: dto.barriers_signage || 0,
-        arcFlash: dto.arc_flash || 0,
-        energizedBeenTested: dto.energized_been_tested || 0,
-        punchesBeenClosed: dto.punches_been_closed || 0,
-        toctChecklist: dto.toct_checklist || 0,
-        informedAligned: dto.informed_aligned || 0,
-        isolatingResponsible:
-          dto.isolating_responsible !== undefined
-            ? dto.isolating_responsible
-            : dto.isolating_resposible || 0,
-        isolatingRiskAssessment: dto.isolating_risk_assessment || 0,
-        cqInformed: dto.cq_informed || 0,
-        cqProvided: dto.cq_provided || 0,
-        deEnergisationRequest: dto.de_energisation_request || 0,
-        ppePrepared: dto.ppe_prepared || 0,
-        absenceOfVoltage: dto.absence_of_voltage || 0,
-        storedEnergy: dto.stored_energy || 0,
-        backupPower: dto.backup_power || 0,
-        unavoidable: dto.unavoidable || 0,
-        reasonablyPracticable: dto.reasonably_practicable || 0,
-        workAuthorised: dto.work_authorised || 0,
-        workingRiskAssessment: dto.working_risk_assessment || 0,
-        workingArcBoundary: dto.working_arc_boundary || 0,
-        workingBarriers: dto.working_barriers || 0,
-        insulatedTools: dto.insulated_tools || 0,
-        eventOfEmergency: dto.event_of_emergency || 0,
-      }),
-    );
-
-    await this.energisingMechRepo.save(
-      this.energisingMechRepo.create({
-        requestId,
-        pressurization: dto.pressurization || 0,
-        performedApproved: dto.performed_approved || 0,
-        flushingApproved: dto.flushing_approved || 0,
-        mcApproved: dto.mc_approved || 0,
-        visualInspection: dto.visual_inspection || 0,
-        lotoPlanApproved: dto.loto_plan_approved || 0,
-        followMediaCode: dto.follow_media_code || 0,
-        cqSafetySigns: dto.cq_safety_signs || 0,
-        mcNumberText: dto.mc_number_text || '',
-      }),
-    );
-
-    await this.excavationRepo.save(
-      this.excavationRepo.create({
-        requestId,
-        excavationShoring: dto.excavation_shoring || 0,
-        excavationSegregated: dto.excavation_segregated || 0,
-        nnStandards: dto.nn_standards || 0,
-        danishRegulation: dto.danish_regulation || 0,
-        safeAccessAndEgress: dto.safe_access_and_egress || 0,
-        correctlySloped: dto.correctly_sloped || 0,
-        inspectionDates: dto.inspection_dates || 0,
-        markedDrawings: dto.marked_drawings || 0,
-        undergroundAreasCleared: dto.underground_areas_cleared || 0,
-        excavationWorks: dto.excavation_works || 0,
-      }),
-    );
-
-    await this.extraMiscRepo.save(
-      this.extraMiscRepo.create({
-        requestId,
-        tools: dto.Tools || dto.tools || '',
-        machinery: dto.Machinery || dto.machinery || '',
-        descriptionOfActivity: dto.description_of_activity || '',
-        mechanicalWorks: dto.mechanical_works || '',
-        electricalWorks: dto.electrical_works || '',
-        conMInitials: dto.ConM_initials || '',
-        conMInitials1: dto.ConM_initials1 || '',
-        coMMInitials: dto.CoMM_initials || '',
-        rejectReason: dto.reject_reason || '',
-        cancelReason: dto.cancel_reason || '',
-        closeNote: dto.close_note || '',
-        newSubContractor: dto.new_sub_contractor || '',
-        workType: dto.work_type || '',
-        ramsNumber: dto.rams_number,
-      }),
-    );
-
-    await this.fireHotworkRepo.save(
-      this.fireHotworkRepo.create({
-        requestId,
-        hotWork: dto.Hot_work || 0,
-        fireWatchEstablish: dto.fire_watch_establish || 0,
-        combustibleMaterial: dto.combustible_material || 0,
-        safetyMeasures: dto.safety_measures || 0,
-        extinguishersAndFireBlanket: dto.extinguishers_and_fire_blanket || 0,
-        weldingActivity:
-          dto.welding_activity !== undefined
-            ? dto.welding_activity
-            : dto.welding_activitiy || 0,
-        heatTreatment: dto.heat_treatment || 0,
-        airExtractionBeEstablished: dto.air_extraction_be_established || 0,
-        nameOfTheFireWatcher: dto.name_of_the_fire_watcher || '',
-        phoneNumberOfTheFireWatcher: dto.phone_number_of_the_fire_watcher || '',
-        fireGuardPresent: dto.fire_guard_present || '',
-        lowRiskHotwork: dto.low_risk_hotwork || '',
-        highRiskHotwork: dto.high_risk_hotwork || '',
-        hotWorkChecklistFilled: dto.hot_work_checklist_filled || '',
-        hHeatSource: dto.h_heat_source || '',
-        hWorkplaceCheck: dto.h_workplace_check || '',
-        hFireDetectors: dto.h_fire_detectors || '',
-        hStartTime: dto.h_start_time || '',
-        hEndTime: dto.h_end_time || '',
-        fireImage: dto.fire_image || '',
-        tasksInProgressInTheArea: dto.tasks_in_progress_in_the_area || 0,
-        accountDuringTheWork: dto.account_during_the_work || 0,
-        lightingSufficiently: dto.lighting_sufficiently || 0,
-        specificRisksBasedOnTask: dto.specific_risks_based_on_task || 0,
-        workEnvironmentSafetyEnsured: dto.work_environment_safety_ensured || 0,
-        courseOfActionInEmergencies: dto.course_of_action_in_emergencies || 0,
-        ifNoLoto: dto.if_no_loto,
-        hazardausSubstances: dto.hazardaus_substances,
-      }),
-    );
-
-    await this.generalRepo.save(
-      this.generalRepo.create({
-        requestId,
-        affectingOtherContractors: dto.affecting_other_contractors || 0,
-        otherConditions: dto.other_conditions || 0,
-        otherConditionsInput: dto.other_conditions_input || '',
-        lightingBeginWork: dto.lighting_begin_work || 0,
-        specificRisks: dto.specific_risks || 0,
-        environmentEnsured: dto.environment_ensured || 0,
-        courseOfActions:
-          dto.course_of_actions !== undefined
-            ? dto.course_of_actions
-            : dto.course_of_action || 0,
-      }),
-    );
-
-    await this.heightRepo.save(
-      this.heightRepo.create({
-        requestId,
-        workingAtHeight: dto.working_at_height || 0,
-        segragatedDemarkated: dto.segragated_demarkated || 0,
-        lanyardAttachments: dto.lanyard_attachments || 0,
-        rescuePlan: dto.rescue_plan || 0,
-        avoidHazards: dto.avoid_hazards || 0,
-        heightTraining: dto.height_training || 0,
-        heightEquipments: dto.height_equipments || 0,
-        supervision: dto.supervision || 0,
-        shockAbsorbing: dto.shock_absorbing || 0,
-        verticalLife: dto.vertical_life || 0,
-        securedFalling: dto.secured_falling || 0,
-        droppedObjects: dto.dropped_objects || 0,
-        safeAcces: dto.safe_acces || 0,
-        weatherAcceptable: dto.weather_acceptable || 0,
-      }),
-    );
-
-    await this.liftingRepo.save(
-      this.liftingRepo.create({
-        requestId,
-        usingCranesOrLifting: dto.using_cranes_or_lifting || 0,
-        appointedPerson: dto.appointed_person || 0,
-        vendorSupplies: dto.vendor_supplies || 0,
-        liftPlan: dto.lift_plan || 0,
-        suppliedAndInspected: dto.supplied_and_inspected || 0,
-        legalRequiredCertificates: dto.legal_required_certificates || 0,
-        praparedLifting: dto.prapared_lifting || 0,
-        liftingTaskFenced: dto.lifting_task_fenced || 0,
-        overheadRisks: dto.overhead_risks || 0,
-      }),
-    );
-
-    await this.ppeRepo.save(
-      this.ppeRepo.create({
-        requestId,
-        specificGloves: dto.specific_gloves || 0,
-        eyeProtection: dto.eye_protection || 0,
-        fallProtection: dto.fall_protection || 0,
-        hearingProtection: dto.hearing_protection || 0,
-        respiratoryProtection: dto.respiratory_protection || 0,
-        otherPpe: dto.other_ppe || '',
-      }),
-    );
-
-    await this.pressureTestingRepo.save(
-      this.pressureTestingRepo.create({
-        requestId,
-        pressureTestingOfEquipment: dto.pressure_testing_of_equipment || 0,
-        lineWalk: dto.line_walk || 0,
-        pressureTestCoordinated: dto.pressure_test_coordinated || 0,
-        pipeworkMic: dto.pipework_mic || 0,
-        lotoPlanAttached: dto.loto_plan_attached || 0,
-        exclusionZoneCalculated: dto.exclusion_zone_calculated || 0,
-        pnematicHydrostatic:
-          dto.pnematic_hydrostatic !== undefined
-            ? dto.pnematic_hydrostatic
-            : dto.pneumatic_hydrostatic || 0,
-        pressureOfTheTest: dto.pressure_of_the_test || '',
-        safetyValvesCalibrated: dto.safety_valves_calibrated || 0,
-        pressurePneumatic: dto.pressure_pneumatic || '',
-        pressureHydrostatic: dto.pressure_hydrostatic || '',
-      }),
-    );
-
-    // 3. Save files
-    if (files && files.length > 0) {
-      for (const file of files) {
-        await this.ramsFileRepo.insert({
-          requestId,
-          ramsFile: file.path.replace(/\\/g, '/'),
-          status: 1,
-          createdAt: new Date(),
-          userId: dto.userId || 0,
-        });
-      }
-    }
-
-    // 4. Create logs
-    await this.createLogs(
-      requestId,
-      dto.userId || 0,
-      dto.Request_status || 'Pending',
-      new Date(),
-      [],
-      0,
-    );
-
-    // 5. Add note if provided in create DTO
-    if (dto.notes && dto.notes.trim() !== '') {
-      let noteUsername = 'System';
-      if (dto.userId) {
-        const user = await this.userRepo.findOne({ where: { id: dto.userId } });
-        if (user && user.username) {
-          noteUsername = user.username;
-        }
-      }
-
-      await this.noteRepo.save(
-        this.noteRepo.create({
-          requestId,
-          permitNo,
-          userId: dto.userId || 0,
-          username: noteUsername,
-          note: dto.notes,
-          createdTime: new Date(),
-        }),
-      );
-    }
-
     await this.redisCacheService.deleteByPattern('requests:*');
 
     return {
       status: 200,
       message: 'Request created successfully',
-      request_id: requestId,
+      request_id: savedRequest.id,
       PermitNo: permitNo,
       username: dto.Foreman || 'System',
     };
@@ -829,7 +1013,19 @@ export class RequestsService {
     dto: UpdateRequestDto,
     files?: any[],
     images?: any[],
+    activeUserType?: string,
   ): Promise<any> {
+    const activeHeader = (activeUserType || '').toLowerCase().trim();
+    if (activeHeader.includes('observer')) {
+      throw new BadRequestException('Observer access is not authorized to modify permits');
+    }
+    if (dto.userId) {
+      const scope = await this.resolveUserScope(dto.userId, activeUserType);
+      if (scope.role === 'observer') {
+        throw new BadRequestException('Observer access is not authorized to modify permits');
+      }
+    }
+
     const existing = await this.requestRepo.findOne({ where: { id } });
     if (!existing) {
       throw new BadRequestException('Request not found');
@@ -859,50 +1055,77 @@ export class RequestsService {
       where: { requestId: id },
     });
 
+    const currentStatus = (existing.requestStatus || '').toLowerCase().trim();
+    const incomingStatus = (dto.Request_status || '').toLowerCase().trim();
+    const isClosingOpenedPermit =
+      currentStatus === 'opened' && incomingStatus === 'closed';
+    let isAdminZoneChangeClose = false;
+
     // 1. Validate zone status and set permit_under dynamically
-    await this.checkZoneStatusAndAssignPermitUnder(dto, existing.zoneId, existing.roomNos);
+    // If closing an Opened permit whose zone status has changed after creation,
+    // restrict regular users and allow only Admin to close with a mandatory close_reason.
+    if (isClosingOpenedPermit) {
+      const zoneChangeInfo = await this.evaluatePermitZoneStatusChange(existing);
+      if (zoneChangeInfo.isZoneStatusChanged) {
+        const actorIsAdmin = await this.isActorAdmin(dto.userId, activeUserType);
+        if (!actorIsAdmin) {
+          throw new ForbiddenException(
+            `Cannot close this permit because the zone status has changed (${zoneChangeInfo.currentStatusLabels.join(', ')}) from ${existing.permitUnder || 'its original status'}. Only an Admin can close this permit with a close reason.`,
+          );
+        }
+        const closeReasonVal = (dto.close_reason ?? '').toString().trim();
+        if (!closeReasonVal) {
+          throw new BadRequestException(
+            'A close reason is required for Admin to close a permit after its zone status has changed.',
+          );
+        }
+        dto.close_reason = closeReasonVal;
+        isAdminZoneChangeClose = true;
+      } else {
+        await this.checkZoneStatusAndAssignPermitUnder(dto, existing.zoneId, existing.buildingId);
+      }
+    } else {
+      await this.checkZoneStatusAndAssignPermitUnder(dto, existing.zoneId, existing.buildingId);
+    }
 
     // 2. Validate mandatory fields (non-draft)
-    this.validateMandatoryFields(dto, existing, {
-      chem,
-      conf,
-      elec,
-      energElec,
-      energMech,
-      exc,
-      ext,
-      fire,
-      gen,
-      hgt,
-      lift,
-      ppe,
-      press,
-    });
+    this.validateMandatoryFields(
+      dto,
+      existing,
+      {
+        chem,
+        conf,
+        elec,
+        energElec,
+        energMech,
+        exc,
+        ext,
+        fire,
+        gen,
+        hgt,
+        lift,
+        ppe,
+        press,
+      },
+      { isAdminZoneChangeClose },
+    );
 
     // Validate status transition
-    const currentStatus = (existing.requestStatus || '').toLowerCase().trim();
     let isStatusChanged = false;
     let finalRequestStatusForLog = 'Edited';
 
     if (dto.Request_status !== undefined && dto.Request_status !== '') {
       const normalizedNew = dto.Request_status.toLowerCase().trim();
       if (normalizedNew !== currentStatus) {
-        try {
-          await this.validateStatusTransitionAndRole(existing, normalizedNew, dto.userId ?? 0);
-          isStatusChanged = true;
-          finalRequestStatusForLog = dto.Request_status;
-        } catch (error) {
-          // If the status transition is invalid (e.g. trying to revert Approved to Draft during edit),
-          // we silently ignore the status change and do NOT update requestStatus in the requests table.
-          isStatusChanged = false;
-          finalRequestStatusForLog = 'Edited';
-        }
+        await this.validateStatusTransitionAndRole(existing, normalizedNew, dto.userId ?? 0, activeUserType);
+        isStatusChanged = true;
+        finalRequestStatusForLog = dto.Request_status;
       }
     } else if (dto.status !== undefined) {
       const normalizedNew = dto.status === 1 ? 'pending' : 'cancelled';
       if (normalizedNew !== currentStatus) {
         try {
-          await this.validateStatusTransitionAndRole(existing, normalizedNew, dto.userId ?? 0);
+          await this.validateStatusTransitionAndRole(existing, normalizedNew, dto.userId ?? 0, activeUserType);
           isStatusChanged = true;
           finalRequestStatusForLog = dto.status === 1 ? 'Pending' : 'Cancelled';
         } catch (error) {
@@ -1257,6 +1480,7 @@ export class RequestsService {
       compare('reject_reason', ext.rejectReason, dto.reject_reason);
       compare('cancel_reason', ext.cancelReason, dto.cancel_reason);
       compare('close_note', ext.closeNote, dto.close_note);
+      compare('close_reason', ext.closeReason, dto.close_reason);
       compare(
         'new_sub_contractor',
         ext.newSubContractor,
@@ -1770,6 +1994,7 @@ export class RequestsService {
       rejectReason: dto.reject_reason,
       cancelReason: dto.cancel_reason,
       closeNote: dto.close_note,
+      closeReason: dto.close_reason,
       newSubContractor: dto.new_sub_contractor,
       workType: dto.work_type,
       ramsNumber: dto.rams_number,
@@ -1987,23 +2212,37 @@ export class RequestsService {
     return `${nextY}-${nextM}-${nextD}`;
   }
 
-  async updateStatus(body: {
-    id: string;
-    Request_status?: string;
-    status?: number;
-    userId?: number;
-    initials?: string;
-    ConM_initials?: string;
-    CoMM_initials?: string;
-    ConM_initials1?: string;
-    reject_reason?: string;
-    cancel_reason?: string;
-    close_note?: string;
-    Start_Time?: string;
-    End_Time?: string;
-    night_shift?: number;
-    new_end_time?: string;
-  }): Promise<any> {
+  async updateStatus(
+    body: {
+      id: string;
+      Request_status?: string;
+      status?: number;
+      userId?: number;
+      initials?: string;
+      ConM_initials?: string;
+      CoMM_initials?: string;
+      ConM_initials1?: string;
+      reject_reason?: string;
+      cancel_reason?: string;
+      close_note?: string;
+      close_reason?: string;
+      Start_Time?: string;
+      End_Time?: string;
+      night_shift?: number;
+      new_end_time?: string;
+    },
+    activeUserType?: string,
+  ): Promise<any> {
+    const activeHeader = (activeUserType || '').toLowerCase().trim();
+    if (activeHeader.includes('observer')) {
+      throw new BadRequestException('Observer access is not authorized to change permit status');
+    }
+    if (body.userId) {
+      const scope = await this.resolveUserScope(body.userId, activeUserType);
+      if (scope.role === 'observer') {
+        throw new BadRequestException('Observer access is not authorized to change permit status');
+      }
+    }
     const {
       id,
       Request_status,
@@ -2016,6 +2255,7 @@ export class RequestsService {
       reject_reason,
       cancel_reason,
       close_note,
+      close_reason,
       Start_Time,
       End_Time,
       night_shift,
@@ -2086,7 +2326,26 @@ export class RequestsService {
             );
           }
 
-          await this.validateStatusTransitionAndRole(existing, targetStatus, userId || 0);
+          await this.validateStatusTransitionAndRole(existing, targetStatus, userId || 0, activeUserType);
+          if (
+            currentStatusClean === 'opened' &&
+            (targetStatusClean === 'closed' || resolvedStatusClean === 'closed')
+          ) {
+            const zoneChangeInfo = await this.evaluatePermitZoneStatusChange(existing);
+            if (zoneChangeInfo.isZoneStatusChanged) {
+              const actorIsAdmin = await this.isActorAdmin(userId, activeUserType);
+              if (!actorIsAdmin) {
+                throw new ForbiddenException(
+                  `Cannot close this permit because the zone status has changed (${zoneChangeInfo.currentStatusLabels.join(', ')}) from ${existing.permitUnder || 'its original status'}. Only an Admin can close this permit with a close reason.`,
+                );
+              }
+              if (!(close_reason || '').trim()) {
+                throw new BadRequestException(
+                  'A close reason is required for Admin to close a permit after its zone status has changed.',
+                );
+              }
+            }
+          }
           if (Request_status !== undefined) {
             updateData.requestStatus = resolvedStatus;
           }
@@ -2113,6 +2372,10 @@ export class RequestsService {
         }
         if (close_note !== undefined && close_note !== '') {
           ext.closeNote = close_note;
+          isExtUpdated = true;
+        }
+        if (close_reason !== undefined && close_reason.trim() !== '') {
+          ext.closeReason = close_reason.trim();
           isExtUpdated = true;
         }
 
@@ -2262,12 +2525,20 @@ export class RequestsService {
         // Create log if status changed
         if (targetStatus !== '') {
           const finalStatus = resolvedStatus || (status === 1 ? 'Pending' : 'Cancelled');
+          const statusFieldChanges: Array<{ field_name: string; previous: string; present: string }> = [];
+          if (close_reason !== undefined && close_reason.trim() !== '') {
+            statusFieldChanges.push({
+              field_name: 'close_reason',
+              previous: '',
+              present: close_reason.trim(),
+            });
+          }
           await this.createLogs(
             existing.id,
             userId || 0,
             finalStatus,
             new Date(),
-            [],
+            statusFieldChanges,
             0,
           );
 
@@ -2381,21 +2652,31 @@ export class RequestsService {
   // Helper to resolve room names from ID string
   private async resolveRoomNames(roomNos?: string): Promise<string> {
     if (!roomNos) return '';
-    const ids = roomNos.split(',').map((s) => s.trim());
-    const allNumeric = ids.every((id) => /^\d+$/.test(id));
-    if (allNumeric && ids.length > 0) {
-      const roomIds = ids.map((id) => Number(id));
-      const rooms = await this.roomRepo.find({
-        where: { room_id: In(roomIds) },
-      });
-      return rooms.map((r) => r.room_name).join(', ');
+    const tokens = roomNos.split(',').map((s) => s.trim()).filter(Boolean);
+    if (tokens.length === 0) return '';
+
+    // Separate numeric IDs from string room names
+    const numericIds = tokens.filter((t) => /^\d+$/.test(t)).map(Number);
+    let roomMap = new Map<string, string>();
+
+    if (numericIds.length > 0) {
+      try {
+        const rooms = await this.roomRepo.find({
+          where: { room_id: In(numericIds) },
+        });
+        roomMap = new Map(rooms.map((r) => [String(r.room_id), r.room_name]));
+      } catch (err) {
+        // Fallback to empty map on error
+      }
     }
-    return roomNos; // Return raw value if not numeric
+
+    return tokens.map((t) => roomMap.get(t) || t).join(', ');
   }
 
   private async resolveLevelFilters(
     floorIdInput?: any,
     roomTypeInput?: any,
+    buildingIdInput?: any,
   ): Promise<{ resolvedFloorIds: number[]; resolvedFloorNames: string[]; rawTerms: string[] } | null> {
     const rawTerms: string[] = [];
 
@@ -2430,16 +2711,51 @@ export class RequestsService {
     });
 
     const floorIdsSet = new Set<number>(directFloorIds);
-    const floorNamesSet = new Set<string>(nameTerms);
+    const floorNamesSet = new Set<string>();
+
+    const buildingIds = this.parseIdList(buildingIdInput);
+
+    // Helper: strip prefix ONLY if an explicit delimiter (- or :) exists (e.g. "B14 - Ground Floor" -> "Ground Floor")
+    // Do NOT strip "Ground " from "Ground Floor"!
+    const getBaseName = (name: string): string => {
+      const stripped = name.replace(/^(?:[A-Za-z0-9_]+\s*[-:]\s*)/, '').trim();
+      const genericWords = ['floor', 'level', 'plan', 'block', 'room', 'zone', 'building'];
+      if (
+        !stripped ||
+        genericWords.includes(stripped.toLowerCase()) ||
+        stripped.toLowerCase() === name.trim().toLowerCase()
+      ) {
+        return '';
+      }
+      return stripped;
+    };
+
+    nameTerms.forEach((term) => {
+      const trimmed = term.trim();
+      floorNamesSet.add(trimmed);
+      const baseName = getBaseName(trimmed);
+      if (baseName) {
+        floorNamesSet.add(baseName);
+      }
+    });
 
     if (directFloorIds.length > 0) {
       try {
-        const foundFloors = await this.floorRepo.findBy({
-          fl_id: In(directFloorIds),
-        });
+        let foundFloors: Floor[] = [];
+        if (buildingIds.length > 0) {
+          foundFloors = await this.floorRepo.find({
+            where: { fl_id: In(directFloorIds), build_id: In(buildingIds) },
+          });
+        } else {
+          foundFloors = await this.floorRepo.findBy({
+            fl_id: In(directFloorIds),
+          });
+        }
         foundFloors.forEach((f) => {
           if (f && f.floor_name) {
             floorNamesSet.add(f.floor_name.trim());
+            const base = getBaseName(f.floor_name);
+            if (base) floorNamesSet.add(base);
           }
         });
       } catch (e) {}
@@ -2447,14 +2763,34 @@ export class RequestsService {
 
     if (nameTerms.length > 0) {
       for (const nTerm of nameTerms) {
+        const fullTerm = nTerm.trim();
+        const baseTerm = getBaseName(nTerm);
         try {
-          const matchingFloors = await this.floorRepo
-            .createQueryBuilder('f')
-            .where('f.floor_name LIKE :name', { name: `%${nTerm}%` })
-            .getMany();
+          const qb = this.floorRepo.createQueryBuilder('f');
+          if (buildingIds.length > 0) {
+            qb.where('f.build_id IN (:...buildingIds)', { buildingIds });
+            qb.andWhere(
+              new Brackets((sub) => {
+                sub.where('f.floor_name LIKE :full', { full: `%${fullTerm}%` });
+                if (baseTerm) {
+                  sub.orWhere('f.floor_name LIKE :base', { base: `%${baseTerm}%` });
+                }
+              }),
+            );
+          } else {
+            qb.where('f.floor_name LIKE :full', { full: `%${fullTerm}%` });
+            if (baseTerm) {
+              qb.orWhere('f.floor_name LIKE :base', { base: `%${baseTerm}%` });
+            }
+          }
+          const matchingFloors = await qb.getMany();
           matchingFloors.forEach((f) => {
             if (f && f.fl_id) floorIdsSet.add(f.fl_id);
-            if (f && f.floor_name) floorNamesSet.add(f.floor_name.trim());
+            if (f && f.floor_name) {
+              floorNamesSet.add(f.floor_name.trim());
+              const base = getBaseName(f.floor_name);
+              if (base) floorNamesSet.add(base);
+            }
           });
         } catch (e) {}
       }
@@ -2676,10 +3012,14 @@ export class RequestsService {
   }
 
   // Search/Filter Requests
-  async search(dto: SearchRequestDto, loggedInUserId?: number): Promise<any> {
-    const subContractorId = await this.getSubcontractorIdForUser(loggedInUserId);
+  async search(dto: SearchRequestDto, loggedInUserId?: number, activeUserType?: string): Promise<any> {
+    const scope = await this.resolveUserScope(loggedInUserId, activeUserType);
+    const subContractorId = scope.subContractorId;
+    const limitToUserId = scope.limitToUserId;
     const key = subContractorId
       ? `requests:search:${JSON.stringify(dto)}:subcon:${subContractorId}`
+      : limitToUserId
+      ? `requests:search:${JSON.stringify(dto)}:user:${limitToUserId}`
       : `requests:search:${JSON.stringify(dto)}`;
     return this.redisCacheService.getOrSet(
       key,
@@ -2894,7 +3234,7 @@ export class RequestsService {
         }
 
         // Level / Floor filtering (supports single or multi-level, floor IDs or floor names, across old & new DB records)
-        const levelRes = await this.resolveLevelFilters(dto.Floor_Id, dto.Room_Type);
+        const levelRes = await this.resolveLevelFilters(dto.Floor_Id, dto.Room_Type, dto.Building_Id);
         if (levelRes) {
           const { resolvedFloorIds, resolvedFloorNames, rawTerms } = levelRes;
           const allTerms = Array.from(new Set([...resolvedFloorNames, ...rawTerms]));
@@ -3033,11 +3373,15 @@ export class RequestsService {
           qb.andWhere('requests.Sub_Contractor_Id = :subContractorIdFilter', {
             subContractorIdFilter: subContractorId,
           });
+        } else if (limitToUserId) {
+          qb.andWhere('requests.userId = :userIdFilter', {
+            userIdFilter: limitToUserId,
+          });
         } else if (dto.LoginType === 'Subcontractor' && dto.user_id) {
-          const user = await this.userRepo.findOne({ where: { id: dto.user_id } });
-          if (user && user.userType === 'Subcontractor') {
+          const userSubId = await this.getSubcontractorIdForUser(dto.user_id);
+          if (userSubId) {
             qb.andWhere('requests.Sub_Contractor_Id = :subContractorIdFilter', {
-              subContractorIdFilter: user.typeId,
+              subContractorIdFilter: userSubId,
             });
           } else {
             qb.andWhere('requests.userId = :userIdFilter', {
@@ -3060,7 +3404,8 @@ export class RequestsService {
         if (dto.using_cranes_or_lifting !== undefined && dto.using_cranes_or_lifting !== null && Number(dto.using_cranes_or_lifting) === 1) {
           activeHraConds.push('lifting.using_cranes_or_lifting = 1');
         }
-        if (dto.pressure_tesing_of_equipment !== undefined && dto.pressure_tesing_of_equipment !== null && Number(dto.pressure_tesing_of_equipment) === 1) {
+        const pressVal = dto.pressure_testing_of_equipment ?? dto.pressure_tesing_of_equipment;
+        if (pressVal !== undefined && pressVal !== null && Number(pressVal) === 1) {
           activeHraConds.push('pressureTesting.pressure_testing_of_equipment = 1');
         }
         if (dto.working_at_height !== undefined && dto.working_at_height !== null && Number(dto.working_at_height) === 1) {
@@ -3083,6 +3428,30 @@ export class RequestsService {
           qb.andWhere(`(${activeHraConds.join(' OR ')})`);
         }
 
+        if (dto.electrical_works) {
+          const eleIds = String(dto.electrical_works).split(',').map((s) => s.trim()).filter(Boolean);
+          if (eleIds.length > 0) {
+            const eleConds = eleIds.map((_, i) => `FIND_IN_SET(:eleWorkVal${i}, REPLACE(extraMisc.electrical_works, ' ', '')) > 0`).join(' OR ');
+            const params: Record<string, string> = {};
+            eleIds.forEach((id, i) => {
+              params[`eleWorkVal${i}`] = id;
+            });
+            qb.andWhere(`(${eleConds})`, params);
+          }
+        }
+
+        if (dto.mechanical_works) {
+          const mechIds = String(dto.mechanical_works).split(',').map((s) => s.trim()).filter(Boolean);
+          if (mechIds.length > 0) {
+            const mechConds = mechIds.map((_, i) => `FIND_IN_SET(:mechWorkVal${i}, REPLACE(extraMisc.mechanical_works, ' ', '')) > 0`).join(' OR ');
+            const params: Record<string, string> = {};
+            mechIds.forEach((id, i) => {
+              params[`mechWorkVal${i}`] = id;
+            });
+            qb.andWhere(`(${mechConds})`, params);
+          }
+        }
+
         // PPE Equipment Filters
         if (dto.specific_gloves !== undefined && dto.specific_gloves !== null && Number(dto.specific_gloves) === 1) {
           qb.andWhere('ppe.specific_gloves = 1');
@@ -3098,40 +3467,6 @@ export class RequestsService {
         }
         if (dto.respiratory_protection !== undefined && dto.respiratory_protection !== null && Number(dto.respiratory_protection) === 1) {
           qb.andWhere('ppe.respiratory_protection = 1');
-        }
-
-        // Electrical Works Filter
-        if (dto.electrical_works && String(dto.electrical_works).trim() !== '') {
-          const elecItems = this.parseStringList(dto.electrical_works);
-          if (elecItems.length > 0) {
-            const elecConds = elecItems.map((item, idx) => 
-              `(FIND_IN_SET(:elecItem_${idx}, extraMisc.electricalWorks) > 0 OR CONCAT(',', extraMisc.electricalWorks, ',') LIKE :elecWorkComma_${idx} OR extraMisc.electricalWorks LIKE :elecWork_${idx})`
-            );
-            const params: Record<string, string> = {};
-            elecItems.forEach((item, idx) => {
-              params[`elecItem_${idx}`] = item;
-              params[`elecWorkComma_${idx}`] = `%,${item},%`;
-              params[`elecWork_${idx}`] = `%${item}%`;
-            });
-            qb.andWhere(`(${elecConds.join(' OR ')})`, params);
-          }
-        }
-
-        // Mechanical Works Filter
-        if (dto.mechanical_works && String(dto.mechanical_works).trim() !== '') {
-          const mechItems = this.parseStringList(dto.mechanical_works);
-          if (mechItems.length > 0) {
-            const mechConds = mechItems.map((item, idx) => 
-              `(FIND_IN_SET(:mechItem_${idx}, extraMisc.mechanicalWorks) > 0 OR CONCAT(',', extraMisc.mechanicalWorks, ',') LIKE :mechWorkComma_${idx} OR extraMisc.mechanicalWorks LIKE :mechWork_${idx})`
-            );
-            const params: Record<string, string> = {};
-            mechItems.forEach((item, idx) => {
-              params[`mechItem_${idx}`] = item;
-              params[`mechWorkComma_${idx}`] = `%,${item},%`;
-              params[`mechWork_${idx}`] = `%${item}%`;
-            });
-            qb.andWhere(`(${mechConds.join(' OR ')})`, params);
-          }
         }
 
         if (
@@ -3155,9 +3490,10 @@ export class RequestsService {
               { zeroStr: '0' }
             );
           } else if (hrasVal === 1) {
+            const pressVal = dto.pressure_testing_of_equipment ?? dto.pressure_tesing_of_equipment;
             const hasSpecificHraFilter = [
               dto.Hot_work, dto.working_on_electrical_system, dto.working_hazardious_substen,
-              dto.using_cranes_or_lifting, dto.pressure_tesing_of_equipment, dto.working_at_height,
+              dto.using_cranes_or_lifting, pressVal, dto.working_at_height,
               dto.working_confined_spaces, dto.power_on, dto.pressurization, dto.excavation_works
             ].some(v => v !== undefined && v !== null && Number(v) === 1);
 
@@ -3179,7 +3515,7 @@ export class RequestsService {
         const [rawRequests, totalCount] = await qb.getManyAndCount();
 
         // Build zone lookup for all zone IDs present in the search results
-        const zoneLookupMap = new Map<number, string>();
+        const zoneLookupMap = new Map<number, { zone: string; building_id?: number; status?: string }>();
         const allZoneIdsSet = new Set<number>();
         rawRequests.forEach((req) => {
           if (req.zoneId) {
@@ -3191,7 +3527,46 @@ export class RequestsService {
         });
         if (allZoneIdsSet.size > 0) {
           const zoneEntities = await this.zoneRepo.findBy({ id: In([...allZoneIdsSet]) });
-          zoneEntities.forEach((z) => zoneLookupMap.set(z.id, z.zone));
+          zoneEntities.forEach((z) =>
+            zoneLookupMap.set(z.id, { zone: z.zone, building_id: z.building_id, status: z.status }),
+          );
+        }
+
+        // Fetch Opened & Closed logs for all requests in batch
+        const formatLogTime = (date: Date | string | undefined | null): string => {
+          if (!date) return '';
+          const d = date instanceof Date ? date : new Date(date);
+          if (isNaN(d.getTime())) return String(date);
+          const pad = (n: number) => String(n).padStart(2, '0');
+          return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        };
+
+        const searchRequestIds = rawRequests.map((r) => r.id);
+        const searchOpenCloseLogsMap = new Map<number, { openTime?: string | Date; openedBy?: string; closeTime?: string | Date; closedBy?: string }>();
+        if (searchRequestIds.length > 0) {
+          const logs = await this.logRepo
+            .createQueryBuilder('log')
+            .leftJoinAndMapOne('log.user', User, 'user', 'log.userId = user.id')
+            .where('log.requestId IN (:...searchRequestIds) AND LOWER(TRIM(log.requestType)) IN (:...types)', {
+              searchRequestIds,
+              types: ['opened', 'open', 'closed', 'close'],
+            })
+            .orderBy('log.id', 'ASC')
+            .getMany();
+
+          for (const l of logs) {
+            const entry = searchOpenCloseLogsMap.get(l.requestId) || {};
+            const typeLower = (l.requestType || '').toLowerCase().trim();
+            const userName = (l as any).user?.username || (l as any).user?.first_name || '';
+            if (typeLower === 'opened' || typeLower === 'open') {
+              entry.openTime = l.createdTime;
+              entry.openedBy = userName;
+            } else if (typeLower === 'closed' || typeLower === 'close') {
+              entry.closeTime = l.createdTime;
+              entry.closedBy = userName;
+            }
+            searchOpenCloseLogsMap.set(l.requestId, entry);
+          }
         }
 
         // Map responses to match legacy format and resolve Room, Building, Level and Zone names
@@ -3200,16 +3575,29 @@ export class RequestsService {
           // Resolve room names
           const resolvedRooms = await this.resolveRoomNames(req.roomNos);
 
-          // Resolve all zone names string
+          // Resolve all zone names string & detect live zone status changes
           let resolvedZoneNames = '';
+          const matchedZoneStatuses: string[] = [];
           if (req.zoneId) {
-            const names = String(req.zoneId)
+            const matchedItems = String(req.zoneId)
               .split(',')
-              .map((id) => zoneLookupMap.get(Number(id.trim())))
-              .filter(Boolean);
+              .map((id) => {
+                const item = zoneLookupMap.get(Number(id.trim()));
+                if (!item) return null;
+                if (req.buildingId && item.building_id && Number(item.building_id) !== Number(req.buildingId)) {
+                  return null;
+                }
+                return item;
+              })
+              .filter(Boolean) as Array<{ zone: string; building_id?: number; status?: string }>;
+            const names = matchedItems.map((m) => m.zone).filter(Boolean);
             if (names.length > 0) {
               resolvedZoneNames = names.join(', ');
             }
+            matchedItems.forEach((m) => {
+              const st = (m.status || '').toUpperCase().trim();
+              if (st) matchedZoneStatuses.push(st);
+            });
           }
           if (!resolvedZoneNames && typeof req.zone === 'string') {
             resolvedZoneNames = req.zone;
@@ -3217,6 +3605,20 @@ export class RequestsService {
           if (!resolvedZoneNames && (req as any).zone?.zone) {
             resolvedZoneNames = (req as any).zone.zone;
           }
+
+          const uniqueMatchedZoneStatuses = Array.from(new Set(matchedZoneStatuses));
+          const permitUnderLower = (req.permitUnder || '').trim().toLowerCase();
+          const expectedZoneStatus =
+            permitUnderLower === 'commissioning'
+              ? 'C'
+              : permitUnderLower === 'construction'
+                ? 'UC'
+                : null;
+          const isZoneStatusChanged =
+            uniqueMatchedZoneStatuses.length > 0 &&
+            (uniqueMatchedZoneStatuses.includes('HO') ||
+              uniqueMatchedZoneStatuses.length > 1 ||
+              (expectedZoneStatus !== null && uniqueMatchedZoneStatuses[0] !== expectedZoneStatus));
 
           // Join safety fields back into flat properties to match legacy output
           const flatObj: any = {
@@ -3248,6 +3650,8 @@ export class RequestsService {
             Zone_Id: req.zoneId || '',
             zone_name: resolvedZoneNames || '',
             zone: resolvedZoneNames || '',
+            current_zone_status: uniqueMatchedZoneStatuses.join(','),
+            is_zone_status_changed: isZoneStatusChanged,
             Room_Nos: resolvedRooms || '',
             room_names: resolvedRooms,
             Room_Type: req.roomType || '',
@@ -3297,6 +3701,26 @@ export class RequestsService {
             flatObj.course_of_action = flatObj.course_of_actions;
           }
 
+          const logInfo = searchOpenCloseLogsMap.get(req.id);
+          if (logInfo) {
+            if (logInfo.openTime) {
+              flatObj.open_time = formatLogTime(logInfo.openTime);
+              flatObj.check_in_time = logInfo.openTime;
+            }
+            if (logInfo.openedBy) {
+              flatObj.opened_by = logInfo.openedBy;
+              flatObj.check_in_user = logInfo.openedBy;
+            }
+            if (logInfo.closeTime) {
+              flatObj.close_time = formatLogTime(logInfo.closeTime);
+              flatObj.check_out_time = logInfo.closeTime;
+            }
+            if (logInfo.closedBy) {
+              flatObj.closed_by = logInfo.closedBy;
+              flatObj.check_out_user = logInfo.closedBy;
+            }
+          }
+
           // Fetch files & notes
           const files = await this.ramsFileRepo.find({
             where: { requestId: req.id, status: 1 },
@@ -3343,19 +3767,18 @@ export class RequestsService {
     );
   }
 
-  async plansList(searchDto: PlanSearchDto, loggedInUserId?: number): Promise<any> {
+  async plansList(searchDto: PlanSearchDto, loggedInUserId?: number, activeUserType?: string): Promise<any> {
     const allowedKeys: (keyof PlanSearchDto)[] = [
       'Date', 'Week', 'Year', 'Month', 'Site_Id', 'Building_Id', 'Sub_Contractor_Id',
       'Room_Type', 'from_date', 'to_date', 'start_time', 'end_time', 'area',
       'permit_type', 'permit_under', 'night_shift', 'new_date', 'new_end_time',
       'hras', 'Request_status', 'Hot_work', 'working_on_electrical_system',
       'working_hazardious_substen', 'using_cranes_or_lifting',
-      'pressure_tesing_of_equipment', 'working_at_height', 'working_confined_spaces',
+      'pressure_testing_of_equipment', 'pressure_tesing_of_equipment', 'working_at_height', 'working_confined_spaces',
       'work_in_atex_area', 'securing_facilities', 'excavation_works',
       'specific_gloves', 'eye_protection', 'fall_protection', 'hearing_protection',
       'respiratory_protection', 'taskSpecificPPE', 'power_on', 'pressurization',
-      'fromDate', 'toDate', 'Start_Time', 'End_Time', 'Zone_Id', 'zone', 'zoneIds', 'Room_Nos', 'Floor_Id', 'Type_Of_Activity_Id', 'PermitNo', 'Activity',
-      'electrical_works', 'mechanical_works'
+      'fromDate', 'toDate', 'Start_Time', 'End_Time', 'Zone_Id', 'zone', 'zoneIds', 'Room_Nos', 'Floor_Id', 'Type_Of_Activity_Id', 'PermitNo', 'Activity'
     ];
     const filteredSearchDto: PlanSearchDto = {};
     for (const key of allowedKeys) {
@@ -3386,7 +3809,7 @@ export class RequestsService {
 
     searchDto = filteredSearchDto;
 
-    const subContractorId = await this.getSubcontractorIdForUser(loggedInUserId);
+    const subContractorId = await this.getSubcontractorIdForUser(loggedInUserId, activeUserType);
     // --- Week parsing ---
         let weekStart: string | null = null;
         let weekEnd: string | null = null;
@@ -3477,7 +3900,7 @@ export class RequestsService {
           qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
         }
         // Level / Floor filtering (supports single or multi-level, floor IDs or floor names, across old & new DB records)
-        const planLevelRes = await this.resolveLevelFilters(searchDto.Floor_Id, searchDto.Room_Type);
+        const planLevelRes = await this.resolveLevelFilters(searchDto.Floor_Id, searchDto.Room_Type, searchDto.Building_Id);
         if (planLevelRes) {
           const { resolvedFloorIds, resolvedFloorNames, rawTerms } = planLevelRes;
           const allTerms = Array.from(new Set([...resolvedFloorNames, ...rawTerms]));
@@ -3587,9 +4010,10 @@ export class RequestsService {
               { zeroStr: '0' }
             );
           } else if (hrasVal === 1) {
+            const pressVal = searchDto.pressure_testing_of_equipment ?? searchDto.pressure_tesing_of_equipment;
             const hasSpecificHraFilter = [
               searchDto.Hot_work, searchDto.working_on_electrical_system, searchDto.working_hazardious_substen,
-              searchDto.using_cranes_or_lifting, searchDto.pressure_tesing_of_equipment, searchDto.working_at_height,
+              searchDto.using_cranes_or_lifting, pressVal, searchDto.working_at_height,
               searchDto.working_confined_spaces, searchDto.power_on, searchDto.pressurization, searchDto.excavation_works
             ].some(v => v !== undefined && v !== null && Number(v) === 1);
 
@@ -3695,8 +4119,9 @@ export class RequestsService {
         if (searchDto.using_cranes_or_lifting && Number(searchDto.using_cranes_or_lifting) === 1) {
           qb.andWhere('lifting.using_cranes_or_lifting = :useCrane', { useCrane: searchDto.using_cranes_or_lifting });
         }
-        if (searchDto.pressure_tesing_of_equipment && Number(searchDto.pressure_tesing_of_equipment) === 1) {
-          qb.andWhere('pressureTesting.pressure_testing_of_equipment = :pressTest', { pressTest: searchDto.pressure_tesing_of_equipment });
+        const planPressVal = searchDto.pressure_testing_of_equipment ?? searchDto.pressure_tesing_of_equipment;
+        if (planPressVal && Number(planPressVal) === 1) {
+          qb.andWhere('pressureTesting.pressure_testing_of_equipment = :pressTest', { pressTest: planPressVal });
         }
         if (searchDto.working_at_height && Number(searchDto.working_at_height) === 1) {
           qb.andWhere('height.working_at_height = :workHeight', { workHeight: searchDto.working_at_height });
@@ -3726,46 +4151,12 @@ export class RequestsService {
           qb.andWhere('energisingMechanical.pressurization = :pressur', { pressur: searchDto.pressurization });
         }
 
-        // Electrical Works Filter
-        if (searchDto.electrical_works && String(searchDto.electrical_works).trim() !== '') {
-          const elecItems = this.parseStringList(searchDto.electrical_works);
-          if (elecItems.length > 0) {
-            const elecConds = elecItems.map((item, idx) => 
-              `(FIND_IN_SET(:planElecItem_${idx}, extraMisc.electricalWorks) > 0 OR CONCAT(',', extraMisc.electricalWorks, ',') LIKE :planElecWorkComma_${idx} OR extraMisc.electricalWorks LIKE :planElecWork_${idx})`
-            );
-            const params: Record<string, string> = {};
-            elecItems.forEach((item, idx) => {
-              params[`planElecItem_${idx}`] = item;
-              params[`planElecWorkComma_${idx}`] = `%,${item},%`;
-              params[`planElecWork_${idx}`] = `%${item}%`;
-            });
-            qb.andWhere(`(${elecConds.join(' OR ')})`, params);
-          }
-        }
-
-        // Mechanical Works Filter
-        if (searchDto.mechanical_works && String(searchDto.mechanical_works).trim() !== '') {
-          const mechItems = this.parseStringList(searchDto.mechanical_works);
-          if (mechItems.length > 0) {
-            const mechConds = mechItems.map((item, idx) => 
-              `(FIND_IN_SET(:planMechItem_${idx}, extraMisc.mechanicalWorks) > 0 OR CONCAT(',', extraMisc.mechanicalWorks, ',') LIKE :planMechWorkComma_${idx} OR extraMisc.mechanicalWorks LIKE :planMechWork_${idx})`
-            );
-            const params: Record<string, string> = {};
-            mechItems.forEach((item, idx) => {
-              params[`planMechItem_${idx}`] = item;
-              params[`planMechWorkComma_${idx}`] = `%,${item},%`;
-              params[`planMechWork_${idx}`] = `%${item}%`;
-            });
-            qb.andWhere(`(${mechConds.join(' OR ')})`, params);
-          }
-        }
-
         // --- No pagination — fetch all records ---
         qb.orderBy('requests.id', 'DESC');
         const [rawRequests, totalCount] = await qb.getManyAndCount();
 
         // Build zone lookup for all zone IDs present in the search results
-        const zoneLookupMap = new Map<number, string>();
+        const zoneLookupMap = new Map<number, { zone: string; building_id?: number; status?: string }>();
         const allZoneIdsSet = new Set<number>();
         rawRequests.forEach((req) => {
           if (req.zoneId) {
@@ -3777,7 +4168,46 @@ export class RequestsService {
         });
         if (allZoneIdsSet.size > 0) {
           const zoneEntities = await this.zoneRepo.findBy({ id: In([...allZoneIdsSet]) });
-          zoneEntities.forEach((z) => zoneLookupMap.set(z.id, z.zone));
+          zoneEntities.forEach((z) =>
+            zoneLookupMap.set(z.id, { zone: z.zone, building_id: z.building_id, status: z.status }),
+          );
+        }
+
+        // Fetch Opened & Closed logs for all requests in batch
+        const formatLogTime = (date: Date | string | undefined | null): string => {
+          if (!date) return '';
+          const d = date instanceof Date ? date : new Date(date);
+          if (isNaN(d.getTime())) return String(date);
+          const pad = (n: number) => String(n).padStart(2, '0');
+          return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        };
+
+        const planRequestIds = rawRequests.map((r) => r.id);
+        const planOpenCloseLogsMap = new Map<number, { openTime?: string | Date; openedBy?: string; closeTime?: string | Date; closedBy?: string }>();
+        if (planRequestIds.length > 0) {
+          const logs = await this.logRepo
+            .createQueryBuilder('log')
+            .leftJoinAndMapOne('log.user', User, 'user', 'log.userId = user.id')
+            .where('log.requestId IN (:...planRequestIds) AND LOWER(TRIM(log.requestType)) IN (:...types)', {
+              planRequestIds,
+              types: ['opened', 'open', 'closed', 'close'],
+            })
+            .orderBy('log.id', 'ASC')
+            .getMany();
+
+          for (const l of logs) {
+            const entry = planOpenCloseLogsMap.get(l.requestId) || {};
+            const typeLower = (l.requestType || '').toLowerCase().trim();
+            const userName = (l as any).user?.username || (l as any).user?.first_name || '';
+            if (typeLower === 'opened' || typeLower === 'open') {
+              entry.openTime = l.createdTime;
+              entry.openedBy = userName;
+            } else if (typeLower === 'closed' || typeLower === 'close') {
+              entry.closeTime = l.createdTime;
+              entry.closedBy = userName;
+            }
+            planOpenCloseLogsMap.set(l.requestId, entry);
+          }
         }
 
         // --- Build flat response ---
@@ -3790,7 +4220,14 @@ export class RequestsService {
           if (req.zoneId) {
             const names = String(req.zoneId)
               .split(',')
-              .map((id) => zoneLookupMap.get(Number(id.trim())))
+              .map((id) => {
+                const item = zoneLookupMap.get(Number(id.trim()));
+                if (!item) return null;
+                if (req.buildingId && item.building_id && Number(item.building_id) !== Number(req.buildingId)) {
+                  return null;
+                }
+                return item.zone;
+              })
               .filter(Boolean);
             if (names.length > 0) {
               resolvedZoneNames = names.join(', ');
@@ -3876,6 +4313,26 @@ export class RequestsService {
 
           if (flatObj.course_of_actions !== undefined) {
             flatObj.course_of_action = flatObj.course_of_actions;
+          }
+
+          const logInfo = planOpenCloseLogsMap.get(req.id);
+          if (logInfo) {
+            if (logInfo.openTime) {
+              flatObj.open_time = formatLogTime(logInfo.openTime);
+              flatObj.check_in_time = logInfo.openTime;
+            }
+            if (logInfo.openedBy) {
+              flatObj.opened_by = logInfo.openedBy;
+              flatObj.check_in_user = logInfo.openedBy;
+            }
+            if (logInfo.closeTime) {
+              flatObj.close_time = formatLogTime(logInfo.closeTime);
+              flatObj.check_out_time = logInfo.closeTime;
+            }
+            if (logInfo.closedBy) {
+              flatObj.closed_by = logInfo.closedBy;
+              flatObj.check_out_user = logInfo.closedBy;
+            }
           }
 
           const files = await this.ramsFileRepo.find({
@@ -4224,32 +4681,10 @@ export class RequestsService {
   }
 
   // 11. Read counts (readCounts.php)
-  async readCounts(loggedInUserId?: number): Promise<any> {
-    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
-    const userTypes = (user?.userType || '')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    let subContractorId: number | null = null;
-    let limitToUserId: number | null = null;
-
-    if (user) {
-      if (userTypes.includes('Subcontractor')) {
-        subContractorId = user.typeId;
-      } else if (
-        userTypes.includes('Admin') ||
-        userTypes.includes('SuperAdmin') ||
-        userTypes.includes('Department') ||
-        userTypes.includes('Department1') ||
-        userTypes.includes('HSE') ||
-        userTypes.includes('Observer')
-      ) {
-        // No filter for admin / department
-      } else {
-        limitToUserId = user.id;
-      }
-    }
+  async readCounts(loggedInUserId?: number, activeUserType?: string): Promise<any> {
+    const scope = await this.resolveUserScope(loggedInUserId, activeUserType);
+    const subContractorId = scope.subContractorId;
+    const limitToUserId = scope.limitToUserId;
 
     const cacheKey = subContractorId
       ? `requests:counts:subcon:${subContractorId}`
@@ -4340,32 +4775,10 @@ export class RequestsService {
   }
 
   // 12. Read single status count (readRequestCount.php)
-  async readRequestCount(status: string, loggedInUserId?: number): Promise<any> {
-    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
-    const userTypes = (user?.userType || '')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    let subContractorId: number | null = null;
-    let limitToUserId: number | null = null;
-
-    if (user) {
-      if (userTypes.includes('Subcontractor')) {
-        subContractorId = user.typeId;
-      } else if (
-        userTypes.includes('Admin') ||
-        userTypes.includes('SuperAdmin') ||
-        userTypes.includes('Department') ||
-        userTypes.includes('Department1') ||
-        userTypes.includes('HSE') ||
-        userTypes.includes('Observer')
-      ) {
-        // No filter
-      } else {
-        limitToUserId = user.id;
-      }
-    }
+  async readRequestCount(status: string, loggedInUserId?: number, activeUserType?: string): Promise<any> {
+    const scope = await this.resolveUserScope(loggedInUserId, activeUserType);
+    const subContractorId = scope.subContractorId;
+    const limitToUserId = scope.limitToUserId;
 
     const cacheKey = subContractorId
       ? `requests:counts:${status}:subcon:${subContractorId}`
@@ -4398,32 +4811,10 @@ export class RequestsService {
   }
 
   // 13. Read Graph counts per day (readGraph.php)
-  async readGraph(WeekFirstday: string, WeekLastday: string, loggedInUserId?: number): Promise<any> {
-    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
-    const userTypes = (user?.userType || '')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    let subContractorId: number | null = null;
-    let limitToUserId: number | null = null;
-
-    if (user) {
-      if (userTypes.includes('Subcontractor')) {
-        subContractorId = user.typeId;
-      } else if (
-        userTypes.includes('Admin') ||
-        userTypes.includes('SuperAdmin') ||
-        userTypes.includes('Department') ||
-        userTypes.includes('Department1') ||
-        userTypes.includes('HSE') ||
-        userTypes.includes('Observer')
-      ) {
-        // No filter
-      } else {
-        limitToUserId = user.id;
-      }
-    }
+  async readGraph(WeekFirstday: string, WeekLastday: string, loggedInUserId?: number, activeUserType?: string): Promise<any> {
+    const scope = await this.resolveUserScope(loggedInUserId, activeUserType);
+    const subContractorId = scope.subContractorId;
+    const limitToUserId = scope.limitToUserId;
 
     const first = new Date(
       WeekFirstday.replace(' GMT+0530 (India Standard Time)', ''),
@@ -4496,32 +4887,10 @@ export class RequestsService {
   }
 
   // 14. Read Graph Counts summary today vs week (readGraphCounts.php)
-  async readGraphCounts(loggedInUserId?: number): Promise<any> {
-    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
-    const userTypes = (user?.userType || '')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    let subContractorId: number | null = null;
-    let limitToUserId: number | null = null;
-
-    if (user) {
-      if (userTypes.includes('Subcontractor')) {
-        subContractorId = user.typeId;
-      } else if (
-        userTypes.includes('Admin') ||
-        userTypes.includes('SuperAdmin') ||
-        userTypes.includes('Department') ||
-        userTypes.includes('Department1') ||
-        userTypes.includes('HSE') ||
-        userTypes.includes('Observer')
-      ) {
-        // Admin/HSE/Department sees all
-      } else {
-        limitToUserId = user.id;
-      }
-    }
+  async readGraphCounts(loggedInUserId?: number, activeUserType?: string): Promise<any> {
+    const scope = await this.resolveUserScope(loggedInUserId, activeUserType);
+    const subContractorId = scope.subContractorId;
+    const limitToUserId = scope.limitToUserId;
 
     const cacheKey = subContractorId
       ? `requests:graph:counts:subcon:${subContractorId}`
@@ -4697,36 +5066,205 @@ export class RequestsService {
     );
   }
 
-  private async checkZoneStatusAndAssignPermitUnder(
-    dto: CreateRequestDto | UpdateRequestDto,
-    existingZoneId?: any,
-    existingRoomNos?: any,
-  ) {
-    let roomIds: number[] = [];
-    let roomNames: string[] = [];
-
-    let roomNosVal = (dto as any).Room_Nos !== undefined ? (dto as any).Room_Nos : (dto as any).room_nos;
-    if ((roomNosVal === undefined || roomNosVal === null || String(roomNosVal).trim() === '') && existingRoomNos) {
-      roomNosVal = existingRoomNos;
-    }
-    if (roomNosVal !== undefined && roomNosVal !== null) {
-      if (Array.isArray(roomNosVal)) {
-        roomNosVal.forEach((item) => {
-          const s = String(item).trim();
-          if (/^\d+$/.test(s)) roomIds.push(Number(s));
-          else if (s) roomNames.push(s);
-        });
-      } else if (typeof roomNosVal === 'string') {
-        String(roomNosVal).split(',').forEach((item) => {
-          const s = item.trim();
-          if (/^\d+$/.test(s)) roomIds.push(Number(s));
-          else if (s) roomNames.push(s);
-        });
-      } else if (typeof roomNosVal === 'number' && roomNosVal > 0) {
-        roomIds.push(roomNosVal);
+  private async isActorAdmin(
+    actorUserId?: number,
+    activeUserType?: string,
+  ): Promise<boolean> {
+    const activeHeader = (activeUserType || '').trim().toLowerCase();
+    if (activeHeader) {
+      if (activeHeader.includes('observer')) return false;
+      if (activeHeader.includes('admin') || activeHeader.includes('superadmin')) {
+        return true;
+      }
+      if (
+        activeHeader.includes('contractor') ||
+        activeHeader.includes('subcontractor') ||
+        activeHeader.includes('department') ||
+        activeHeader.includes('conm') ||
+        activeHeader.includes('c&q') ||
+        activeHeader.includes('comm') ||
+        activeHeader.includes('hse')
+      ) {
+        return false;
       }
     }
 
+    if (!actorUserId) {
+      return false;
+    }
+
+    const user = await this.userRepo.findOne({ where: { id: actorUserId } });
+    if (!user) {
+      return false;
+    }
+
+    const scope = await this.resolveUserScope(actorUserId, activeUserType);
+    if (scope.role === 'admin') {
+      return true;
+    }
+
+    const userTypes = (user.userType || '')
+      .split(',')
+      .map((t) => t.trim().toLowerCase())
+      .filter(Boolean);
+    return userTypes.includes('admin') || userTypes.includes('superadmin');
+  }
+
+  private async evaluatePermitZoneStatusChange(existing: RequestEntity): Promise<{
+    isZoneStatusChanged: boolean;
+    hasHO: boolean;
+    hasMixedStatuses: boolean;
+    hasStatusMismatch: boolean;
+    currentStatuses: string[];
+    currentStatusLabels: string[];
+    expectedZoneStatus: string | null;
+    zones: Zone[];
+  }> {
+    const statusLabels: Record<string, string> = {
+      UC: 'Construction',
+      C: 'Commissioning',
+      HO: 'Hand Over',
+    };
+
+    let zoneIds: number[] = [];
+    if (existing.zoneId !== undefined && existing.zoneId !== null && String(existing.zoneId).trim() !== '') {
+      zoneIds = String(existing.zoneId)
+        .split(',')
+        .map((id) => Number(id.trim()))
+        .filter((id) => !isNaN(id) && id > 0);
+    }
+
+    let zones: Zone[] = [];
+    if (zoneIds.length > 0) {
+      zones = await this.zoneRepo.find({ where: { id: In(zoneIds) } });
+    }
+
+    const targetBuildingId =
+      existing.buildingId !== undefined && existing.buildingId !== null
+        ? Number(existing.buildingId)
+        : null;
+
+    if (zones.length > 0 && targetBuildingId && !isNaN(targetBuildingId)) {
+      const filteredByBuilding = zones.filter(
+        (z) => Number(z.building_id) === targetBuildingId,
+      );
+      if (filteredByBuilding.length > 0) {
+        zones = filteredByBuilding;
+      }
+    }
+
+    if (
+      zones.length > 0 &&
+      existing.floorId !== undefined &&
+      existing.floorId !== null &&
+      String(existing.floorId).trim() !== ''
+    ) {
+      const allowedFloorIds = new Set(
+        String(existing.floorId)
+          .split(',')
+          .map((f) => Number(f.trim()))
+          .filter((n) => !isNaN(n) && n > 0),
+      );
+      if (allowedFloorIds.size > 0) {
+        const filteredByFloor = zones.filter(
+          (z) => z.floor_id && allowedFloorIds.has(Number(z.floor_id)),
+        );
+        if (filteredByFloor.length > 0) {
+          zones = filteredByFloor;
+        }
+      }
+    }
+
+    if (
+      existing.roomNos !== undefined &&
+      existing.roomNos !== null &&
+      String(existing.roomNos).trim() !== ''
+    ) {
+      const roomTokens = String(existing.roomNos)
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (roomTokens.length > 0) {
+        const numericRoomIds = roomTokens
+          .map((t) => Number(t))
+          .filter((n) => !isNaN(n) && n > 0);
+        let matchedRooms: Room[] = [];
+        if (numericRoomIds.length > 0) {
+          matchedRooms = await this.roomRepo.find({
+            where: { room_id: In(numericRoomIds) },
+          });
+        }
+        if (matchedRooms.length === 0) {
+          matchedRooms = await this.roomRepo.find({
+            where: { room_name: In(roomTokens) },
+          });
+        }
+        if (targetBuildingId && !isNaN(targetBuildingId)) {
+          const bRooms = matchedRooms.filter(
+            (r) => Number(r.building_id) === targetBuildingId,
+          );
+          if (bRooms.length > 0) matchedRooms = bRooms;
+        }
+        const roomZoneIds = Array.from(
+          new Set(
+            matchedRooms
+              .map((r) => Number(r.zone_id))
+              .filter((id) => !isNaN(id) && id > 0),
+          ),
+        );
+        if (roomZoneIds.length > 0) {
+          if (zones.length > 0) {
+            const roomZoneSet = new Set(roomZoneIds);
+            const filteredByRoom = zones.filter((z) => roomZoneSet.has(z.id));
+            if (filteredByRoom.length > 0) {
+              zones = filteredByRoom;
+            }
+          } else {
+            zones = await this.zoneRepo.find({ where: { id: In(roomZoneIds) } });
+          }
+        }
+      }
+    }
+
+    const statuses = zones
+      .map((z) => (z.status || '').toUpperCase().trim())
+      .filter(Boolean);
+    const uniqueStatuses = Array.from(new Set(statuses));
+
+    const permitUnderNorm = (existing.permitUnder || '').trim().toLowerCase();
+    const expectedZoneStatus =
+      permitUnderNorm === 'commissioning'
+        ? 'C'
+        : permitUnderNorm === 'construction'
+          ? 'UC'
+          : null;
+
+    const hasHO = statuses.includes('HO');
+    const hasMixedStatuses = uniqueStatuses.length > 1;
+    const hasStatusMismatch =
+      expectedZoneStatus !== null &&
+      uniqueStatuses.length === 1 &&
+      uniqueStatuses[0] !== expectedZoneStatus;
+    const isZoneStatusChanged =
+      zones.length > 0 && (hasHO || hasMixedStatuses || hasStatusMismatch);
+
+    return {
+      isZoneStatusChanged,
+      hasHO,
+      hasMixedStatuses,
+      hasStatusMismatch,
+      currentStatuses: uniqueStatuses,
+      currentStatusLabels: uniqueStatuses.map((s) => statusLabels[s] || s),
+      expectedZoneStatus,
+      zones,
+    };
+  }
+
+  private async checkZoneStatusAndAssignPermitUnder(
+    dto: CreateRequestDto | UpdateRequestDto,
+    existingZoneId?: any,
+    existingBuildingId?: any,
+  ) {
     let zoneIds: number[] = [];
     const zoneIdVal = dto.Zone_Id !== undefined ? dto.Zone_Id : existingZoneId;
     if (zoneIdVal !== undefined && zoneIdVal !== null) {
@@ -4739,59 +5277,88 @@ export class RequestsService {
           .split(',')
           .map((id) => Number(id.trim()))
           .filter((id) => !isNaN(id) && id > 0);
-      } else if (typeof zoneIdVal === 'number' && zoneIdVal > 0) {
-        zoneIds = [zoneIdVal];
+      } else if (typeof zoneIdVal === 'number') {
+        zoneIds = zoneIdVal > 0 ? [zoneIdVal] : [];
       }
     }
 
-    let rooms: Room[] = [];
-    if (roomIds.length > 0) {
-      rooms = await this.roomRepo.find({ where: { room_id: In(roomIds) } });
-    }
-    if (rooms.length === 0 && roomNames.length > 0) {
-      rooms = await this.roomRepo.find({ where: { room_name: In(roomNames) } });
-    }
-    if (rooms.length === 0 && zoneIds.length > 0) {
-      rooms = await this.roomRepo.find({ where: { zone_id: In(zoneIds) } });
-    }
-
-    if (rooms.length === 0 && (roomIds.length > 0 || roomNames.length > 0)) {
-      throw new BadRequestException('Selected rooms not found');
-    }
-
-    if (rooms.length === 0 && zoneIds.length > 0) {
-      const zones = await this.zoneRepo.find({
+    if (zoneIds.length > 0) {
+      let zones = await this.zoneRepo.find({
         where: { id: In(zoneIds) },
       });
       if (zones.length === 0) {
         throw new BadRequestException('Selected zones not found');
       }
-      const zoneStatuses = zones.map((z) => (z.status || 'UC').toUpperCase().trim());
-      if (zoneStatuses.includes('HO') || zoneStatuses.includes('HAND OVER')) {
-        throw new BadRequestException('Cannot create a permit if room status is HO');
-      }
-      const uniqueZoneStatuses = Array.from(new Set(zoneStatuses));
-      if (uniqueZoneStatuses.length > 1) {
-        throw new BadRequestException('All selected rooms must belong to the same status');
-      }
-      const commonStatus = uniqueZoneStatuses[0];
-      if (commonStatus === 'UC') {
-        dto.permit_under = 'Construction';
-      } else if (commonStatus === 'C') {
-        dto.permit_under = 'Commissioning';
-      }
-      dto.Zone_Id = zoneIds.join(',');
-      return;
-    }
 
-    if (rooms.length > 0) {
-      const statuses = rooms.map((r) => (r.status || 'UC').toUpperCase().trim());
-      if (statuses.includes('HO') || statuses.includes('HAND OVER')) {
-        throw new BadRequestException('Cannot create a permit if room status is HO');
+      // Filter by building if Building_Id is provided or exists on record
+      const targetBuildingId = dto.Building_Id !== undefined && dto.Building_Id !== null
+        ? Number(dto.Building_Id)
+        : (existingBuildingId !== undefined && existingBuildingId !== null ? Number(existingBuildingId) : null);
+
+      if (targetBuildingId && !isNaN(targetBuildingId)) {
+        const filteredByBuilding = zones.filter((z) => Number(z.building_id) === targetBuildingId);
+        if (filteredByBuilding.length > 0) {
+          zones = filteredByBuilding;
+          zoneIds = zones.map((z) => z.id);
+        }
+      }
+
+      // Filter by floor if Floor_Id is provided
+      const targetFloorIdVal = dto.Floor_Id;
+      if (targetFloorIdVal !== undefined && targetFloorIdVal !== null && String(targetFloorIdVal).trim() !== '') {
+        const allowedFloorIds = new Set(
+          String(targetFloorIdVal)
+            .split(',')
+            .map((f) => Number(f.trim()))
+            .filter((n) => !isNaN(n) && n > 0),
+        );
+        if (allowedFloorIds.size > 0) {
+          const filteredByFloor = zones.filter((z) => z.floor_id && allowedFloorIds.has(Number(z.floor_id)));
+          if (filteredByFloor.length > 0) {
+            zones = filteredByFloor;
+            zoneIds = zones.map((z) => z.id);
+          }
+        }
+      }
+
+      // Filter by room if Room_Nos is provided
+      if (dto.Room_Nos !== undefined && dto.Room_Nos !== null && String(dto.Room_Nos).trim() !== '') {
+        const roomTokens = String(dto.Room_Nos).split(',').map((s) => s.trim()).filter(Boolean);
+        if (roomTokens.length > 0) {
+          const numericRoomIds = roomTokens.map((t) => Number(t)).filter((n) => !isNaN(n) && n > 0);
+          let matchedRooms: Room[] = [];
+          if (numericRoomIds.length > 0) {
+            matchedRooms = await this.roomRepo.find({ where: { room_id: In(numericRoomIds) } });
+          }
+          if (matchedRooms.length === 0) {
+            matchedRooms = await this.roomRepo.find({ where: { room_name: In(roomTokens) } });
+          }
+          if (targetBuildingId && !isNaN(targetBuildingId)) {
+            const bRooms = matchedRooms.filter((r) => Number(r.building_id) === targetBuildingId);
+            if (bRooms.length > 0) matchedRooms = bRooms;
+          }
+          const roomZoneIds = new Set(matchedRooms.map((r) => Number(r.zone_id)).filter((id) => !isNaN(id) && id > 0));
+          if (roomZoneIds.size > 0) {
+            const filteredByRoom = zones.filter((z) => roomZoneIds.has(z.id));
+            if (filteredByRoom.length > 0) {
+              zones = filteredByRoom;
+              zoneIds = zones.map((z) => z.id);
+            }
+          }
+        }
+      }
+
+      const statuses = zones.map((z) => (z.status || '').toUpperCase().trim());
+      if (statuses.includes('HO')) {
+        throw new BadRequestException(
+          'Cannot create a permit if zone status is HO',
+        );
       }
       const uniqueStatuses = Array.from(new Set(statuses));
       if (uniqueStatuses.length > 1) {
-        throw new BadRequestException('All selected rooms must belong to the same status');
+        throw new BadRequestException(
+          'All selected zones must belong to the same status',
+        );
       }
       const commonStatus = uniqueStatuses[0];
       if (commonStatus === 'UC') {
@@ -4799,8 +5366,26 @@ export class RequestsService {
       } else if (commonStatus === 'C') {
         dto.permit_under = 'Commissioning';
       }
-      if (zoneIds.length > 0) {
-        dto.Zone_Id = zoneIds.join(',');
+      dto.Zone_Id = zoneIds.join(',');
+
+      // Also synchronize dto.zone if provided
+      if (dto.zone !== undefined && dto.zone !== null) {
+        const validZoneNames = zones.map((z) => z.zone).filter(Boolean);
+        const validNamesSet = new Set(validZoneNames.map((n) => n.trim().toLowerCase()));
+        const rawZone: any = dto.zone;
+        if (typeof rawZone === 'string') {
+          const matchedNames = rawZone
+            .split(',')
+            .map((s: string) => s.trim())
+            .filter((s: string) => validNamesSet.has(s.toLowerCase()));
+          dto.zone = matchedNames.length > 0 ? matchedNames.join(',') : validZoneNames.join(',');
+        } else if (Array.isArray(rawZone)) {
+          const filteredItems = rawZone.filter((item: any) => {
+            const zName = typeof item === 'object' ? (item.zone || item.zone_name) : String(item);
+            return zName && validNamesSet.has(String(zName).trim().toLowerCase());
+          });
+          (dto as any).zone = filteredItems.length > 0 ? filteredItems : validZoneNames.join(',');
+        }
       }
     }
   }
@@ -4809,6 +5394,7 @@ export class RequestsService {
     dto: CreateRequestDto | UpdateRequestDto,
     existing?: RequestEntity,
     subTables?: any,
+    options?: { isAdminZoneChangeClose?: boolean },
   ) {
     const currentStatus = (existing?.requestStatus || '').toLowerCase().trim();
     const requestStatusVal =
@@ -5359,6 +5945,8 @@ export class RequestsService {
         'other_conditions',
         subTables?.gen?.otherConditions,
       );
+      checkCheckbox('affecting_other_contractors', subTables?.gen?.affectingOtherContractors);
+      checkCheckbox('other_conditions', subTables?.gen?.otherConditions);
       if (Number(otherConditions) === 1) {
         checkRequired(
           'other_conditions_input',
@@ -5454,8 +6042,13 @@ export class RequestsService {
       const cancelReason = getSubField('cancel_reason', subTables?.ext?.cancelReason);
       checkRequiredSubField('cancel_reason', cancelReason);
     } else if (newStatus === 'closed') {
-      const closeNote = getSubField('close_note', subTables?.ext?.closeNote);
-      checkRequiredSubField('close_note', closeNote);
+      if (options?.isAdminZoneChangeClose) {
+        const closeReason = getSubField('close_reason', subTables?.ext?.closeReason);
+        checkRequiredSubField('close_reason', closeReason);
+      } else {
+        const closeNote = getSubField('close_note', subTables?.ext?.closeNote);
+        checkRequiredSubField('close_note', closeNote);
+      }
     }
 
     if (errors.length > 0) {
@@ -5539,45 +6132,30 @@ export class RequestsService {
       throw new BadRequestException('Permit number not found');
     }
 
-    // 3. Validate rooms/zones exist and have consistent status
-    let roomEntities: Room[] = [];
-    const targetRoomNos = dto.Room_Nos || originalRequest.roomNos;
-    if (targetRoomNos) {
-      const roomParts = String(targetRoomNos).split(',').map((s) => s.trim()).filter(Boolean);
-      const roomIds = roomParts.map((s) => Number(s)).filter((n) => !isNaN(n) && n > 0);
-      if (roomIds.length > 0) {
-        roomEntities = await this.roomRepo.find({ where: { room_id: In(roomIds) } });
-      }
-      if (roomEntities.length === 0 && roomParts.length > 0) {
-        roomEntities = await this.roomRepo.find({ where: { room_name: In(roomParts) } });
-      }
-    }
-    if (roomEntities.length === 0 && zoneIds.length > 0) {
-      roomEntities = await this.roomRepo.find({ where: { zone_id: In(zoneIds) } });
+    // 3. Validate zones exist and have consistent status (lookup by IDs)
+    const targetBuildingId = dto.Building_Id !== undefined && dto.Building_Id !== null
+      ? Number(dto.Building_Id)
+      : (originalRequest.buildingId ? Number(originalRequest.buildingId) : null);
+
+    let zoneEntities = await this.zoneRepo.findBy({ id: In(zoneIds) });
+    if (!zoneEntities || zoneEntities.length === 0) {
+      throw new BadRequestException('Zone not found');
     }
 
-    let roomStatus = 'UC';
-    if (roomEntities.length > 0) {
-      const statuses = [...new Set(roomEntities.map((r) => (r.status || 'UC').toUpperCase().trim()))];
-      if (statuses.length > 1) {
-        throw new BadRequestException('Rooms have different status');
+    if (targetBuildingId && !isNaN(targetBuildingId)) {
+      const filteredByBuilding = zoneEntities.filter((z) => Number(z.building_id) === targetBuildingId);
+      if (filteredByBuilding.length > 0) {
+        zoneEntities = filteredByBuilding;
+        zoneIds = zoneEntities.map((z) => z.id);
       }
-      roomStatus = statuses[0];
-    } else if (zoneIds.length > 0) {
-      const zoneEntities = await this.zoneRepo.findBy({ id: In(zoneIds) });
-      if (!zoneEntities || zoneEntities.length === 0) {
-        throw new BadRequestException('Zone not found');
-      }
-      const statuses = [...new Set(zoneEntities.map((z) => (z.status || 'UC').toUpperCase().trim()))];
-      if (statuses.length > 1) {
-        throw new BadRequestException('Zones have different status');
-      }
-      roomStatus = statuses[0];
     }
 
-    if (roomStatus === 'HO' || roomStatus === 'HAND OVER') {
-      throw new BadRequestException('Permit not allowed to copy to Hand Over rooms');
+    const statuses = [...new Set(zoneEntities.map((z) => (z.status || '').toUpperCase().trim()))];
+    if (statuses.length > 1) {
+      throw new BadRequestException('Zones have different status');
     }
+
+    const zoneStatus = statuses[0];
 
     // 4. Determine permit type of original
     const permitType =
@@ -5585,10 +6163,10 @@ export class RequestsService {
         ? 'Construction'
         : (originalRequest.permitUnder || '').trim();
 
-    if (roomStatus === 'UC' && permitType === 'Commissioning') {
+    if (zoneStatus === 'UC' && permitType === 'Commissioning') {
       throw new BadRequestException('Permit not allowed to copy');
     }
-    if (roomStatus === 'C' && permitType === 'Construction') {
+    if (zoneStatus === 'C' && permitType === 'Construction') {
       throw new BadRequestException('Permit not allowed to copy');
     }
 
@@ -5639,9 +6217,10 @@ export class RequestsService {
 
     // 7. Resolve zone and zoneId safely truncated to max 250 characters
     const resolvedZoneId = zoneIds.join(',').substring(0, 250);
-    const zoneEntities = zoneIds.length > 0 ? await this.zoneRepo.findBy({ id: In(zoneIds) }) : [];
     const fetchedZoneNames = zoneEntities.map((z) => z.zone).filter(Boolean);
-    const combinedZoneNames = zoneNamesFromDto.length > 0 ? zoneNamesFromDto.join(',') : fetchedZoneNames.join(',');
+    const allowedZoneNames = new Set(fetchedZoneNames.map((n) => n.trim().toLowerCase()));
+    const validZoneNamesFromDto = zoneNamesFromDto.filter((n) => allowedZoneNames.has(n.trim().toLowerCase()));
+    const combinedZoneNames = validZoneNamesFromDto.length > 0 ? validZoneNamesFromDto.join(',') : fetchedZoneNames.join(',');
     const resolvedZone = (combinedZoneNames || originalRequest.zone || '').substring(0, 250);
 
     const createdIds: number[] = [];
@@ -5688,7 +6267,7 @@ export class RequestsService {
         assignEndDate: dto.Assign_End_Date ?? originalRequest.assignEndDate,
         workingDate: iterDate,
         buildingId: dto.Building_Id ?? originalRequest.buildingId,
-        floorId: dto.Floor_Id ?? originalRequest.floorId,
+        floorId: dto.Floor_Id !== undefined && dto.Floor_Id !== null ? String(dto.Floor_Id) : originalRequest.floorId,
         zoneId: resolvedZoneId,
         zone: resolvedZone,
         roomNos: dto.Room_Nos ?? originalRequest.roomNos,
@@ -5698,12 +6277,12 @@ export class RequestsService {
         createdTime,
         siteId: dto.Site_Id ?? originalRequest.siteId ?? 5,
         permitType: originalRequest.permitType,
-        permitUnder: originalRequest.permitUnder || 'Construction',
+        permitUnder: zoneStatus === 'C' ? 'Commissioning' : (zoneStatus === 'UC' ? 'Construction' : (originalRequest.permitUnder || 'Construction')),
         newDate: resolvedNewDate,
         newEndTime: dto.New_End_Time ?? originalRequest.newEndTime,
         nightShift: isNightShift ? '1' : '0',
         numberOfWorkers: dto.Number_Of_Workers ?? originalRequest.numberOfWorkers,
-        safetyPrecautions: originalRequest.safetyPrecautions,
+        safetyPrecautions: originalRequest.safetyPrecautions || '',
       });
 
       const saved = await this.requestRepo.save(newRequest);
@@ -5772,6 +6351,7 @@ export class RequestsService {
           rejectReason: null,
           cancelReason: null,
           closeNote: null,
+          closeReason: null,
           requestId
         }));
       } else {
@@ -5919,7 +6499,11 @@ export class RequestsService {
         try {
           const zoneEntities = await this.zoneRepo.findBy({ id: In(ids) });
           if (zoneEntities && zoneEntities.length > 0) {
-            resolvedZoneNames = zoneEntities.map((z) => z.zone).filter(Boolean).join(', ');
+            const matchingZones = req.buildingId
+              ? zoneEntities.filter((z) => Number(z.building_id) === Number(req.buildingId))
+              : zoneEntities;
+            const validZones = matchingZones.length > 0 ? matchingZones : zoneEntities;
+            resolvedZoneNames = validZones.map((z) => z.zone).filter(Boolean).join(', ');
           }
         } catch (e) {
           // ignore lookup error
@@ -5927,7 +6511,18 @@ export class RequestsService {
       }
     }
     if (!resolvedZoneNames && typeof req.zone === 'string') {
-      resolvedZoneNames = req.zone;
+      if (req.buildingId) {
+        try {
+          const bZones = await this.zoneRepo.findBy({ building_id: Number(req.buildingId) });
+          const bZoneNames = new Set(bZones.map((z) => (z.zone || '').trim().toLowerCase()));
+          const filtered = req.zone.split(',').map((s) => s.trim()).filter((s) => bZoneNames.has(s.toLowerCase()));
+          resolvedZoneNames = filtered.length > 0 ? filtered.join(', ') : req.zone;
+        } catch (e) {
+          resolvedZoneNames = req.zone;
+        }
+      } else {
+        resolvedZoneNames = req.zone;
+      }
     }
     if (!resolvedZoneNames && (req as any).zone?.zone) {
       resolvedZoneNames = (req as any).zone.zone;
@@ -6039,6 +6634,24 @@ export class RequestsService {
     }
     if (flatObj.pneumatic_hydrostatic !== undefined) {
       flatObj.pnematic_hydrostatic = flatObj.pneumatic_hydrostatic;
+    }
+    if (flatObj.pressure_pneumatic !== undefined) {
+      flatObj.pressurePneumatic = flatObj.pressure_pneumatic;
+    }
+    if (flatObj.pressurePneumatic !== undefined) {
+      flatObj.pressure_pneumatic = flatObj.pressurePneumatic;
+    }
+    if (flatObj.pressure_hydrostatic !== undefined) {
+      flatObj.pressureHydrostatic = flatObj.pressure_hydrostatic;
+    }
+    if (flatObj.pressureHydrostatic !== undefined) {
+      flatObj.pressure_hydrostatic = flatObj.pressureHydrostatic;
+    }
+    if (flatObj.pressure_of_the_test !== undefined) {
+      flatObj.pressureOfTheTest = flatObj.pressure_of_the_test;
+    }
+    if (flatObj.pressureOfTheTest !== undefined) {
+      flatObj.pressure_of_the_test = flatObj.pressureOfTheTest;
     }
     if (flatObj.specific_risks_based_on_task !== undefined) {
       flatObj.spesific_risks_based_on_task = flatObj.specific_risks_based_on_task;

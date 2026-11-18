@@ -2,9 +2,11 @@ import {
   HttpStatus,
   Injectable,
   NotFoundException,
+  Logger,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Like, FindOptionsWhere } from 'typeorm';
+import { Repository, Like, FindOptionsWhere, SelectQueryBuilder } from 'typeorm';
 import { Employee } from './entities/employee.entity';
 import { CreateDepEmployeeDto, CreateEmpDto, CreateEmployeeDto, CreateSubEmployeeDto, CreateUserLogDto, SearchEmployeeDto, UpdateDepEmployeeDto, UpdateEmpDto, UpdateEmployeeDto, UpdateSubEmployeeDto, SubContEmployeesQueryDto, EmpListByDeptDto } from './dtos/employee.dto';
 import { UserLog } from './entities/userlog.entity';
@@ -49,7 +51,9 @@ const CACHE_KEYS = {
 };
 
 @Injectable()
-export class EmployeesService {
+export class EmployeesService implements OnModuleInit {
+  private readonly logger = new Logger(EmployeesService.name);
+
   constructor(
     @InjectRepository(Employee)
     private readonly employeeRepo: Repository<Employee>,
@@ -65,6 +69,24 @@ export class EmployeesService {
 
     private readonly cache: RedisCacheService,
   ) { }
+
+  async onModuleInit() {
+    await this.cache.deleteByPattern('employees:*');
+  }
+
+  /**
+   * Restricts admin user records from employee query results.
+   * Admins are defined as:
+   * 1. Any employee linked to a user whose userType contains 'admin' or 'superadmin'
+   * 2. Any employee with roleId = 0
+   * 3. System employee id = 0
+   */
+  private applyNonAdminFilter(qb: SelectQueryBuilder<Employee>, alias = 'employee'): void {
+    qb.andWhere(
+      `(${alias}.id NOT IN (SELECT u.empId FROM users u WHERE u.empId IS NOT NULL AND (LOWER(u.userType) LIKE :adminPattern OR LOWER(u.userType) LIKE :superAdminPattern)) AND (${alias}.roleId != 0 OR ${alias}.roleId IS NULL) AND ${alias}.id != 0)`,
+      { adminPattern: '%admin%', superAdminPattern: '%superadmin%' },
+    );
+  }
 
   private async invalidateAfterWrite(options: {
     employeeId?: number;
@@ -99,18 +121,57 @@ export class EmployeesService {
     }));
   }
 
+  private normalizeOtpNotificationType(type?: string): string {
+    const raw = String(type || '').toUpperCase();
+    if (raw === 'BOTH' || raw === 'ALL' || (raw.includes('EMAIL') && raw.includes('SMS'))) {
+      return 'BOTH';
+    }
+    if (raw === 'EMAIL') {
+      return 'EMAIL';
+    }
+    return 'SMS';
+  }
+
+  private validateOtpNotificationChannels(type: string, email?: string, phone?: string): { valid: boolean; message?: string } {
+    if (!email || !email.trim()) {
+      return { valid: false, message: 'Email address is mandatory' };
+    }
+    const isSms = type === 'SMS' || type === 'BOTH';
+    if (isSms && (!phone || !String(phone).trim())) {
+      return { valid: false, message: 'Phone number is mandatory when SMS OTP notification is selected' };
+    }
+    return { valid: true };
+  }
+
   private applyEmployeeFields(existing: Employee, dto: any) {
     if (dto.roleId !== undefined && dto.roleId !== null) existing.roleId = Number(dto.roleId);
     if (dto.departId !== undefined) existing.departId = dto.departId ? Number(dto.departId) : null as any;
     if (dto.subContId !== undefined) existing.subContId = dto.subContId ? Number(dto.subContId) : null as any;
-    if (dto.obserId !== undefined) existing.obserId = dto.obserId ? Number(dto.obserId) : null as any;
+    if (dto.obserId !== undefined) {
+      existing.obserId = dto.obserId ? Number(dto.obserId) : null as any;
+    } else if (
+      (dto.userType && String(dto.userType).includes('Observer')) ||
+      (dto.moduleAccess && String(dto.moduleAccess).includes('Observer'))
+    ) {
+      if (!existing.obserId) {
+        existing.obserId = dto.departId ? Number(dto.departId) : 1;
+      }
+    }
     if (dto.badgeId !== undefined) existing.badgeId = dto.badgeId;
     if (dto.employeeName !== undefined && dto.employeeName !== null) existing.employeeName = dto.employeeName;
     if (dto.companyName !== undefined) existing.companyName = dto.companyName;
     if (dto.email !== undefined) existing.email = dto.email;
     if (dto.designation !== undefined) existing.designation = dto.designation;
     if (dto.access !== undefined) existing.access = dto.access;
+    if (dto.moduleAccess !== undefined) {
+      existing.moduleAccess = Array.isArray(dto.moduleAccess)
+        ? dto.moduleAccess.join(',')
+        : dto.moduleAccess;
+    }
     if (dto.username !== undefined) existing.username = dto.username;
+    if (dto.otpNotificationType !== undefined) {
+      existing.otpNotificationType = this.normalizeOtpNotificationType(dto.otpNotificationType);
+    }
 
     if (dto.phonenumber !== undefined && dto.phonenumber !== null) {
       const rawPhone = String(dto.phonenumber).replace(/^\++/, '');
@@ -127,7 +188,7 @@ export class EmployeesService {
 
   private async syncUserForEmployee(employee: Employee, dto: any, userType?: string) {
     try {
-      if (dto.username || dto.password || userType || dto.departId || dto.subContId || dto.obserId) {
+      if (dto.username || dto.password || userType || dto.departId || dto.subContId || dto.obserId || employee.obserId) {
         let user = await this.userRepo.findOne({ where: { empId: employee.id } });
         if (!user) {
           user = this.userRepo.create({
@@ -147,7 +208,13 @@ export class EmployeesService {
         if (dto.departId) user.typeId = dto.departId;
         else if (dto.subContId) user.typeId = dto.subContId;
         else if (dto.obserId) user.typeId = dto.obserId;
-        if (dto.otp) user.otp = dto.otp;
+        else if (employee.departId) user.typeId = employee.departId;
+        else if (employee.subContId) user.typeId = employee.subContId;
+        else if (employee.obserId) user.typeId = employee.obserId;
+        else if (userType?.toLowerCase().includes('observer')) user.typeId = 1;
+        else if (user.typeId === undefined || user.typeId === null) user.typeId = 0;
+
+        if (dto.otp !== undefined) user.otp = dto.otp;
         await this.userRepo.save(user);
       }
     } catch (err) {
@@ -164,17 +231,20 @@ export class EmployeesService {
     return this.cache.getOrSet(
       cacheKey,
       async () => {
-        const findOptions: any = {
-          order: { createdTime: 'DESC' },
-        };
+        const qb = this.employeeRepo.createQueryBuilder('employee');
+        this.applyNonAdminFilter(qb, 'employee');
+
         if (subContId) {
-          findOptions.where = { subContId };
+          qb.andWhere('employee.subContId = :subContId', { subContId });
         }
+
+        qb.orderBy('employee.createdTime', 'DESC');
+
         if (!isExport) {
-          findOptions.take = limit;
-          findOptions.skip = (page - 1) * limit;
+          qb.skip((page - 1) * limit).take(limit);
         }
-        const [employees, total] = await this.employeeRepo.findAndCount(findOptions);
+
+        const [employees, total] = await qb.getManyAndCount();
         const mappedData = await this.mapSubContractorAndUserType(employees);
         if (mappedData.length > 0) {
           return {
@@ -229,15 +299,17 @@ export class EmployeesService {
     return this.cache.getOrSet(
       `employees:list:subcont:${subContId}:${isExport}:${page}:${limit}`,
       async () => {
-        const findOptions: any = {
-          where: { subContId },
-          order: { createdTime: 'DESC' },
-        };
+        const qb = this.employeeRepo.createQueryBuilder('employee');
+        this.applyNonAdminFilter(qb, 'employee');
+        qb.andWhere('employee.subContId = :subContId', { subContId });
+
+        qb.orderBy('employee.createdTime', 'DESC');
+
         if (!isExport) {
-          findOptions.take = limit;
-          findOptions.skip = (page - 1) * limit;
+          qb.skip((page - 1) * limit).take(limit);
         }
-        const [employees, total] = await this.employeeRepo.findAndCount(findOptions);
+
+        const [employees, total] = await qb.getManyAndCount();
         const mappedData = await this.mapSubContractorAndUserType(employees);
         if (mappedData.length > 0) {
           return {
@@ -265,15 +337,17 @@ export class EmployeesService {
     return this.cache.getOrSet(
       `employees:list:dept:${departId}:${isExport}:${page}:${limit}`,
       async () => {
-        const findOptions: any = {
-          where: { departId },
-          order: { createdTime: 'DESC' },
-        };
+        const qb = this.employeeRepo.createQueryBuilder('employee');
+        this.applyNonAdminFilter(qb, 'employee');
+        qb.andWhere('employee.departId = :departId', { departId });
+
+        qb.orderBy('employee.createdTime', 'DESC');
+
         if (!isExport) {
-          findOptions.take = limit;
-          findOptions.skip = (page - 1) * limit;
+          qb.skip((page - 1) * limit).take(limit);
         }
-        const [employees, total] = await this.employeeRepo.findAndCount(findOptions);
+
+        const [employees, total] = await qb.getManyAndCount();
         const mappedData = await this.mapSubContractorAndUserType(employees);
         if (mappedData.length > 0) {
           return {
@@ -342,52 +416,32 @@ export class EmployeesService {
         const { page = 1, limit = 10, isExport = false } = dto;
         const skip = (page - 1) * limit;
 
-        let where: FindOptionsWhere<Employee> | FindOptionsWhere<Employee>[];
+        const qb = this.employeeRepo.createQueryBuilder('employee');
+        this.applyNonAdminFilter(qb, 'employee');
 
-        if (dto.search) {
-          const searchPattern = Like(`%${dto.search}%`);
-          if (subContId) {
-            where = [
-              { employeeName: searchPattern, subContId },
-              { email: searchPattern, subContId },
-              { badgeId: searchPattern, subContId },
-              { username: searchPattern, subContId },
-              { companyName: searchPattern, subContId },
-              { designation: searchPattern, subContId },
-            ];
-          } else {
-            where = [
-              { employeeName: searchPattern },
-              { email: searchPattern },
-              { badgeId: searchPattern },
-              { username: searchPattern },
-              { companyName: searchPattern },
-              { designation: searchPattern },
-            ];
-          }
-          if (dto.companyName) {
-            if (Array.isArray(where)) {
-              where = where.map(w => ({ ...w, companyName: dto.companyName }));
-            }
-          }
-        } else {
-          const baseWhere: any = {};
-          if (subContId) baseWhere.subContId = subContId;
-          if (dto.companyName) baseWhere.companyName = dto.companyName;
-          where = baseWhere;
+        if (subContId) {
+          qb.andWhere('employee.subContId = :subContId', { subContId });
         }
 
-        const findOptions: any = {
-          where,
-          order: { createdTime: 'DESC' },
-        };
+        if (dto.companyName) {
+          qb.andWhere('employee.companyName = :companyName', { companyName: dto.companyName });
+        }
+
+        if (dto.search && dto.search.trim()) {
+          const searchPattern = `%${dto.search.trim()}%`;
+          qb.andWhere(
+            '(employee.employeeName LIKE :searchPattern OR employee.email LIKE :searchPattern OR employee.badgeId LIKE :searchPattern OR employee.username LIKE :searchPattern OR employee.companyName LIKE :searchPattern OR employee.designation LIKE :searchPattern)',
+            { searchPattern },
+          );
+        }
+
+        qb.orderBy('employee.createdTime', 'DESC');
 
         if (!isExport) {
-          findOptions.take = limit;
-          findOptions.skip = skip;
+          qb.skip(skip).take(limit);
         }
 
-        const [data, total] = await this.employeeRepo.findAndCount(findOptions);
+        const [data, total] = await qb.getManyAndCount();
 
         const mappedData = await this.mapSubContractorAndUserType(data);
         if (mappedData.length > 0) {
@@ -424,10 +478,23 @@ export class EmployeesService {
       return { statusCode: HttpStatus.CONFLICT, message: 'Username already exists' };
     }
 
+    const effectiveType = this.normalizeOtpNotificationType(dto.otpNotificationType);
+    const validation = this.validateOtpNotificationChannels(effectiveType, dto.email, dto.phonenumber);
+    if (!validation.valid) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: validation.message! };
+    }
+
+    const isObserver = (dto.userType && String(dto.userType).includes('Observer')) ||
+      (dto.moduleAccess && String(dto.moduleAccess).includes('Observer')) ||
+      Boolean(dto.obserId);
+    const resolvedObserId = dto.obserId ? Number(dto.obserId) : (isObserver ? (dto.departId ? Number(dto.departId) : 1) : undefined);
+
     const employee = this.employeeRepo.create({
       ...dto,
+      obserId: resolvedObserId,
       phonenumber: dto.phonenumber ? `+${dto.phonenumber}` : undefined,
       password: dto.password ? encodePassword(dto.password) : undefined,
+      otpNotificationType: this.normalizeOtpNotificationType(dto.otpNotificationType),
     } as any) as any as Employee;
 
     await this.employeeRepo.save(employee);
@@ -437,7 +504,7 @@ export class EmployeesService {
     if (!userType) {
       if (dto.subContId) userType = 'Subcontractor';
       else if (dto.departId) userType = 'Department';
-      else if (dto.obserId) userType = 'Observer';
+      else if (dto.obserId || isObserver) userType = 'Observer';
       else userType = 'Admin';
     }
 
@@ -522,9 +589,16 @@ export class EmployeesService {
       return { statusCode: HttpStatus.CONFLICT, message: 'Username already exists' };
     }
 
+    const effectiveType = this.normalizeOtpNotificationType(dto.otpNotificationType);
+    const validation = this.validateOtpNotificationChannels(effectiveType, dto.email, dto.phonenumber);
+    if (!validation.valid) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: validation.message! };
+    }
+
     const employee = this.employeeRepo.create({
       ...dto,
       password: dto.password ? encodePassword(dto.password) : undefined,
+      otpNotificationType: dto.otpNotificationType ? String(dto.otpNotificationType).toUpperCase() : 'SMS',
     } as any) as any as Employee;
 
     await this.employeeRepo.save(employee);
@@ -548,6 +622,14 @@ export class EmployeesService {
       const existing = await this.employeeRepo.findOne({ where: { id: dto.id } });
       if (!existing) {
         return { statusCode: HttpStatus.NOT_FOUND, message: 'Employee not found' };
+      }
+
+      const effectiveType = this.normalizeOtpNotificationType(dto.otpNotificationType !== undefined ? dto.otpNotificationType : existing.otpNotificationType);
+      const effectiveEmail = dto.email !== undefined ? dto.email : existing.email;
+      const effectivePhone = dto.phonenumber !== undefined ? dto.phonenumber : existing.phonenumber;
+      const validation = this.validateOtpNotificationChannels(effectiveType, effectiveEmail, effectivePhone);
+      if (!validation.valid) {
+        return { statusCode: HttpStatus.BAD_REQUEST, message: validation.message! };
       }
 
       this.applyEmployeeFields(existing, dto);
@@ -650,6 +732,14 @@ export class EmployeesService {
         return { statusCode: HttpStatus.CONFLICT, message: 'Username already exists' };
       }
 
+      const effectiveType = this.normalizeOtpNotificationType(dto.otpNotificationType !== undefined ? dto.otpNotificationType : existing.otpNotificationType);
+      const effectiveEmail = dto.email !== undefined ? dto.email : existing.email;
+      const effectivePhone = dto.phonenumber !== undefined ? dto.phonenumber : existing.phonenumber;
+      const validation = this.validateOtpNotificationChannels(effectiveType, effectiveEmail, effectivePhone);
+      if (!validation.valid) {
+        return { statusCode: HttpStatus.BAD_REQUEST, message: validation.message! };
+      }
+
       this.applyEmployeeFields(existing, dto);
       await this.employeeRepo.save(existing);
 
@@ -691,9 +781,14 @@ export class EmployeesService {
   async createUserLog(
     dto: CreateUserLogDto,
   ): Promise<{ statusCode: HttpStatus; message: string }> {
-    const log = this.userLogRepo.create(dto);
-    await this.userLogRepo.save(log);
-    return { statusCode: HttpStatus.OK, message: 'User Log Created' };
+    try {
+      const log = this.userLogRepo.create(dto);
+      await this.userLogRepo.save(log);
+      return { statusCode: HttpStatus.OK, message: 'User Log Created' };
+    } catch (err: any) {
+      this.logger.warn(`Failed to create user log: ${err?.message || err}`);
+      return { statusCode: HttpStatus.OK, message: 'User Log processed with warning' };
+    }
   }
 
   async getUserLogs(

@@ -288,13 +288,16 @@ export function generatePermitHtml(data: any): string {
     { id: 'cq_safety_signs', text: 'C&Q Safety signs are in place?' }
   ];
 
-  const renderCheckRow = (question: string, val: any) => {
+  const renderCheckRow = (question: string, val: any, extraHtml?: string) => {
     const isYes = val !== undefined && val !== null && Number(val) === 1;
     const isNo = val !== undefined && val !== null && Number(val) === 0;
     const isNa = val !== undefined && val !== null && Number(val) === 2;
     return `
       <tr>
-        <td>${question}</td>
+        <td>
+          <div>${question}</div>
+          ${extraHtml || ''}
+        </td>
         <td class="check-cell">${isYes ? '<span class="check-indicator check-yes">✓</span>' : '-'}</td>
         <td class="check-cell">${isNo ? '<span class="check-indicator check-no">✓</span>' : '-'}</td>
         <td class="check-cell">${isNa ? '<span class="check-indicator check-na">✓</span>' : '-'}</td>
@@ -394,48 +397,50 @@ export function generatePermitHtml(data: any): string {
     });
   }
 
-  // Branch for Rejected vs Approved
+  // Check Approved (include if permit was approved at any point, or if currently approved/opened/closed)
+  if (
+    logApproved ||
+    (requestStatus.toLowerCase() === 'approved' && !logRejected && !logCancelled)
+  ) {
+    trackingSteps.push({
+      label: 'Approved',
+      log: logApproved || (requestStatus.toLowerCase() === 'approved' ? { createdTime: new Date(), user: { username: 'System' } } : undefined),
+      iconType: 'approved',
+    });
+  }
+
+  // Check terminal or progress steps after Approval / Pre-Approval
   if (logRejected || requestStatus.toLowerCase() === 'rejected') {
     trackingSteps.push({
       label: 'Rejected',
       log: logRejected,
       iconType: 'rejected',
     });
-  } else {
-    // Approved
+  } else if (
+    logCancelled ||
+    requestStatus.toLowerCase() === 'cancelled' ||
+    requestStatus.toLowerCase() === 'auto-cancelled'
+  ) {
+    const isAutoCancelled =
+      requestStatus.toLowerCase() === 'auto-cancelled' ||
+      (logCancelled && Number(logCancelled.system) === 1);
     trackingSteps.push({
-      label: 'Approved',
-      log: logApproved,
-      iconType: 'approved',
+      label: isAutoCancelled ? 'Auto-Cancelled' : 'Cancelled',
+      log: logCancelled,
+      iconType: 'cancelled',
     });
-
-    // Check if Cancelled after approved
-    if (
-      logCancelled ||
-      requestStatus.toLowerCase() === 'cancelled' ||
-      requestStatus.toLowerCase() === 'auto-cancelled'
-    ) {
-      const isAutoCancelled =
-        requestStatus.toLowerCase() === 'auto-cancelled' ||
-        (logCancelled && Number(logCancelled.system) === 1);
-      trackingSteps.push({
-        label: isAutoCancelled ? 'Auto-Cancelled' : 'Cancelled',
-        log: logCancelled,
-        iconType: 'cancelled',
-      });
-    } else {
-      // Standard flow: Opened -> Closed
-      trackingSteps.push({
-        label: 'Opened',
-        log: logOpened,
-        iconType: 'opened',
-      });
-      trackingSteps.push({
-        label: 'Closed',
-        log: logClosed,
-        iconType: 'closed',
-      });
-    }
+  } else {
+    // Standard flow: Opened -> Closed
+    trackingSteps.push({
+      label: 'Opened',
+      log: logOpened,
+      iconType: 'opened',
+    });
+    trackingSteps.push({
+      label: 'Closed',
+      log: logClosed,
+      iconType: 'closed',
+    });
   }
 
   // Find active step index: the last step in the list that has a log record
@@ -930,7 +935,7 @@ export function generatePermitHtml(data: any): string {
       const filename = rawPath ? rawPath.split('/').pop().split('\\').pop() : 'Attachment';
       const fileId = file.ramsFileId !== undefined ? file.ramsFileId : (file.rams_file_id !== undefined ? file.rams_file_id : file.id);
       return `
-            <a href="/m3infrastructure/requests/files/${fileId}" target="_blank" download class="attachment-box">
+            <a href="/development/m3infrastructure/requests/files/${fileId}" target="_blank" download class="attachment-box">
               <div class="attachment-icon-wrap">
                 <svg class="attachment-file-icon text-danger" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
@@ -2007,78 +2012,6 @@ export function generatePermitHtml(data: any): string {
       </div>
     </div>
 
-    <!-- Location & Schedule Section -->
-    <div class="dashboard-card" style="margin-bottom: 20px;">
-      <div class="card-section-header">
-        <div class="card-section-title-wrap">
-          <span class="card-section-icon">
-            ${getCardHeaderIcon('location')}
-          </span>
-          <div>
-            <h2 class="card-section-title">Location & Schedule</h2>
-            <p class="card-section-subtitle">Where and when the work occurs</p>
-          </div>
-        </div>
-      </div>
-      <div class="info-grid">
-        <div>
-          <div class="info-label">Building</div>
-          <div class="info-value">${data.building_name || '-'}</div>
-        </div>
-        <div>
-          <div class="info-label">Level</div>
-          <div class="info-value">${data.Room_Type || '-'}</div>
-        </div>
-        <div>
-          <div class="info-label">Zone</div>
-          <div class="info-value">${data.zone_name || '-'}</div>
-        </div>
-        <div>
-          <!-- Empty spacer to align the grid -->
-        </div>
-        <div class="info-fullwidth">
-          <div class="info-label">Specific Rooms</div>
-          <div class="info-value">${formatRooms(data.room_names || data.Room_Nos)}</div>
-        </div>
-        <div>
-          <div class="info-label">Permit Type</div>
-          <div class="info-value">${data.permit_type || '-'}</div>
-        </div>
-        <div>
-          <div class="info-label">Permit Under</div>
-          <div class="info-value">${data.permit_under || 'Construction'}</div>
-        </div>
-        <div>
-          <div class="info-label">Date</div>
-          <div class="info-value">${formatDateOnly(data.Working_Date)}</div>
-        </div>
-        <div>
-          <div class="info-label">Time</div>
-          <div class="info-value">${formatTimeOnly(data.Start_Time)} - ${formatTimeOnly(data.End_Time)}</div>
-        </div>
-        
-        ${Number(data.night_shift) === 1 ? `
-        <div class="info-fullwidth" style="margin-top: 4px;">
-          <div style="background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%); border: 1px solid #4338ca; border-left: 5px solid #818cf8; border-radius: 8px; padding: 14px 16px; box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2); display: flex; gap: 32px; align-items: flex-start;">
-            <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#818cf8" style="width: 22px; height: 22px; flex-shrink: 0;">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.72 9.72 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
-              </svg>
-              <div>
-                <div style="font-size: 10px; font-weight: 800; color: #a5b4fc; letter-spacing: 0.5px; margin-bottom: 3px;">NEW DATE (Working After Midnight)</div>
-                <div style="font-size: 14px; font-weight: 800; color: #e0e7ff;">${formatDateOnly(data.new_date)}</div>
-              </div>
-            </div>
-            <div style="flex: 1; border-left: 1px solid #4338ca; padding-left: 24px;">
-              <div style="font-size: 10px; font-weight: 800; color: #a5b4fc; letter-spacing: 0.5px; margin-bottom: 3px;">NEW END TIME</div>
-              <div style="font-size: 14px; font-weight: 800; color: #e0e7ff;">${formatTimeOnly(data.new_end_time)}</div>
-            </div>
-          </div>
-        </div>
-        ` : ''}
-      </div>
-    </div>
-
     <!-- Work Details & Resources Section -->
     <div class="dashboard-card" style="margin-bottom: 20px;">
       <div class="card-section-header">
@@ -2166,6 +2099,78 @@ export function generatePermitHtml(data: any): string {
       </div>
     </div>
 
+    <!-- Location & Schedule Section -->
+    <div class="dashboard-card" style="margin-bottom: 20px;">
+      <div class="card-section-header">
+        <div class="card-section-title-wrap">
+          <span class="card-section-icon">
+            ${getCardHeaderIcon('location')}
+          </span>
+          <div>
+            <h2 class="card-section-title">Location & Schedule</h2>
+            <p class="card-section-subtitle">Where and when the work occurs</p>
+          </div>
+        </div>
+      </div>
+      <div class="info-grid">
+        <div>
+          <div class="info-label">Building</div>
+          <div class="info-value">${data.building_name || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Level</div>
+          <div class="info-value">${data.Room_Type || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Zone</div>
+          <div class="info-value">${data.zone_name || '-'}</div>
+        </div>
+        <div>
+          <!-- Empty spacer to align the grid -->
+        </div>
+        <div class="info-fullwidth">
+          <div class="info-label">Specific Rooms</div>
+          <div class="info-value">${formatRooms(data.room_names || data.Room_Nos)}</div>
+        </div>
+        <div>
+          <div class="info-label">Permit Type</div>
+          <div class="info-value">${data.permit_type || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Permit Under</div>
+          <div class="info-value">${data.permit_under || 'Construction'}</div>
+        </div>
+        <div>
+          <div class="info-label">Date</div>
+          <div class="info-value">${formatDateOnly(data.Working_Date)}</div>
+        </div>
+        <div>
+          <div class="info-label">Time</div>
+          <div class="info-value">${formatTimeOnly(data.Start_Time)} - ${formatTimeOnly(data.End_Time)}</div>
+        </div>
+        
+        ${Number(data.night_shift) === 1 ? `
+        <div class="info-fullwidth" style="margin-top: 4px;">
+          <div style="background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%); border: 1px solid #4338ca; border-left: 5px solid #818cf8; border-radius: 8px; padding: 14px 16px; box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2); display: flex; gap: 32px; align-items: flex-start;">
+            <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#818cf8" style="width: 22px; height: 22px; flex-shrink: 0;">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.72 9.72 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
+              </svg>
+              <div>
+                <div style="font-size: 10px; font-weight: 800; color: #a5b4fc; letter-spacing: 0.5px; margin-bottom: 3px;">NEW DATE (Working After Midnight)</div>
+                <div style="font-size: 14px; font-weight: 800; color: #e0e7ff;">${formatDateOnly(data.new_date)}</div>
+              </div>
+            </div>
+            <div style="flex: 1; border-left: 1px solid #4338ca; padding-left: 24px;">
+              <div style="font-size: 10px; font-weight: 800; color: #a5b4fc; letter-spacing: 0.5px; margin-bottom: 3px;">NEW END TIME</div>
+              <div style="font-size: 14px; font-weight: 800; color: #e0e7ff;">${formatTimeOnly(data.new_end_time)}</div>
+            </div>
+          </div>
+        </div>
+        ` : ''}
+      </div>
+    </div>
+
     <!-- Required PPE and Detailed Approvals & Notes Side-by-Side Row -->
     <div class="two-col-grid" style="margin-bottom: 20px;">
       <!-- Required PPE -->
@@ -2212,7 +2217,11 @@ export function generatePermitHtml(data: any): string {
             <div class="info-label">Cancel Reason</div>
             <div class="info-value mb-2">${data.cancel_reason || 'N/A'}</div>
             <div class="info-label">Close Note</div>
-            <div class="info-value">${data.close_note || 'N/A'}</div>
+            <div class="info-value${data.close_reason ? ' mb-2' : ''}">${data.close_note || 'N/A'}</div>
+            ${data.close_reason ? `
+            <div class="info-label">Close Reason (Admin Override)</div>
+            <div class="info-value">${data.close_reason}</div>
+            ` : ''}
           </div>
         </div>
       </div>
@@ -2477,7 +2486,8 @@ export function generatePermitHtml(data: any): string {
 
       <!-- Pressure Testing of Equipment -->
       ${(() => {
-      if (data.permit_type !== 'Commissioning') return '';
+      const pType = String(data.permit_type || '').toLowerCase().trim();
+      if (pType !== 'commissioning' && Number(data.pressure_testing_of_equipment) !== 1) return '';
       const isPressureActive = Number(data.pressure_testing_of_equipment) === 1;
       if (!isPressureActive) {
         return `
@@ -2511,7 +2521,35 @@ export function generatePermitHtml(data: any): string {
               </tr>
             </thead>
             <tbody>
-              ${pressureQuestions.map(q => renderCheckRow(q.text, data[q.id])).join('')}
+              ${pressureQuestions.map(q => {
+        const val = data[q.id] !== undefined
+          ? data[q.id]
+          : (q.id === 'pneumatic_hydrostatic'
+            ? (data.pnematic_hydrostatic !== undefined ? data.pnematic_hydrostatic : (data.pneumaticHydrostatic !== undefined ? data.pneumaticHydrostatic : data.pnematicHydrostatic))
+            : (q.id === 'pressure_of_the_test'
+              ? (data.pressureOfTheTest !== undefined ? data.pressureOfTheTest : undefined)
+              : undefined));
+        const isYes = val !== undefined && val !== null && Number(val) === 1;
+        let extraHtml = '';
+        if (q.id === 'pneumatic_hydrostatic' && isYes) {
+          const pneumaticPressure = data.pressure_pneumatic || data.pressurePneumatic || '';
+          extraHtml = `
+                    <div style="margin-top: 6px; font-size: 12px; color: #475569;">
+                      <span style="font-weight: 700; color: #334155; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px;">PRESSURE OF PNEUMATIC TEST (IN BARG):</span>
+                      <span style="display: inline-block; margin-left: 6px; padding: 2px 8px; background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 4px; font-weight: 600; color: #0f172a; word-break: break-all;">${pneumaticPressure || '-'}</span>
+                    </div>
+                  `;
+        } else if (q.id === 'pressure_of_the_test' && isYes) {
+          const hydroPressure = data.pressure_hydrostatic || data.pressureHydrostatic || (data.pressure_of_the_test && isNaN(Number(data.pressure_of_the_test)) ? data.pressure_of_the_test : '');
+          extraHtml = `
+                    <div style="margin-top: 6px; font-size: 12px; color: #475569;">
+                      <span style="font-weight: 700; color: #334155; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px;">PRESSURE OF HYDROSTATIC TEST (IN BARG):</span>
+                      <span style="display: inline-block; margin-left: 6px; padding: 2px 8px; background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 4px; font-weight: 600; color: #0f172a; word-break: break-all;">${hydroPressure || '-'}</span>
+                    </div>
+                  `;
+        }
+        return renderCheckRow(q.text, val, extraHtml);
+      }).join('')}
             </tbody>
           </table>
         </div>
@@ -2916,7 +2954,7 @@ export function generatePermitHtml(data: any): string {
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
   <script>
     function test() {
-      window.location.href = "/m3infrastructure/requests/permit-design/${data.PermitNo}/pdf";
+      window.location.href = "/development/m3infrastructure/requests/permit-design/${data.PermitNo}/pdf";
     }
   </script>
 </body>

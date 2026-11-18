@@ -24,9 +24,6 @@ export class Room {
   @Column({ name: 'building_id', type: 'int', nullable: true })
   building_id?: number;
 
-  @Column({ name: 'status', type: 'varchar', length: 255, nullable: true, default: 'UC' })
-  status?: string;
-
   @Column({ name: 'zone_id', type: 'int', nullable: true })
   zone_id?: number;
 

@@ -51,8 +51,14 @@ export class Employee {
   @Column({ nullable: true })
   access: string;
 
+  @Column({ name: 'module_access', nullable: true })
+  moduleAccess: string;
+
   @Column({ nullable: true })
   username: string;
+
+  @Column({ name: 'otp_notification_type', nullable: true, default: 'SMS' })
+  otpNotificationType: string;
 
   /**
    * Stored as base64 in the legacy system.

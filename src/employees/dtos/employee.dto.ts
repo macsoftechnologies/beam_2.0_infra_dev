@@ -26,10 +26,12 @@ export class CreateEmployeeDto {
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsEmail() email?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
   @IsOptional() @IsString() userType?: string;
   @IsOptional() @IsString() otp?: string;
+  @IsOptional() @IsString() otpNotificationType?: string;
 }
 
 // ─── CREATE DEP EMPLOYEE ─────────────────────────────────────────────────────
@@ -46,6 +48,7 @@ export class CreateDepEmployeeDto {
   @IsOptional() @IsString() designation?: string;
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
   @IsOptional() @IsString() otp?: string;
@@ -68,6 +71,7 @@ export class CreateSubEmployeeDto {
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsEmail() email?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
 }
@@ -89,8 +93,10 @@ export class CreateEmpDto {
   @IsOptional() @IsString() companyName?: string;
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
+  @IsOptional() @IsString() otpNotificationType?: string;
 }
 
 // ─── UPDATE EMPLOYEE (generic / main) ────────────────────────────────────────
@@ -108,10 +114,12 @@ export class UpdateEmployeeDto {
   @IsOptional() @IsString() designation?: string;
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
   @IsOptional() @IsString() userType?: string;
   @IsOptional() @IsString() otp?: string;
+  @IsOptional() @IsString() otpNotificationType?: string;
 }
 
 // ─── UPDATE DEP EMPLOYEE ─────────────────────────────────────────────────────
@@ -125,6 +133,7 @@ export class UpdateDepEmployeeDto {
   @IsOptional() @IsString() designation?: string;
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
 }
@@ -140,6 +149,7 @@ export class UpdateSubEmployeeDto {
   @IsOptional() @IsString() designation?: string;
   @IsOptional() @IsString() phonenumber?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
 }
@@ -158,8 +168,10 @@ export class UpdateEmpDto {
   @IsOptional() @IsEmail() email?: string;
   @IsOptional() @IsString() companyName?: string;
   @IsOptional() @IsString() access?: string;
+  @IsOptional() @IsString() moduleAccess?: string;
   @IsOptional() @IsString() username?: string;
   @IsOptional() @IsString() password?: string;
+  @IsOptional() @IsString() otpNotificationType?: string;
 }
 
 // ─── DELETE EMPLOYEE ──────────────────────────────────────────────────────────
