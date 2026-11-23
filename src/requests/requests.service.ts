@@ -6477,6 +6477,7 @@ export class RequestsService implements OnModuleInit {
   }
 
   async getRequestDetailsById(id: number): Promise<any> {
+    if (!id || isNaN(id) || id <= 0) return null;
     const qb = this.getRequestDetailsQueryBuilder()
       .where('requests.id = :id AND requests.status = 1', { id });
     return this.getRequestDetailsFromQueryBuilder(qb);

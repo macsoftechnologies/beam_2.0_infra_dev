@@ -14,7 +14,10 @@ export class ZonesService {
   ) { }
 
   async create(createZoneDto: CreateZoneDto): Promise<Zone> {
-    const zone = this.zonesRepo.create(createZoneDto);
+    const zone = this.zonesRepo.create({
+      ...createZoneDto,
+      createdTime: new Date(),
+    });
     const savedZone = await this.zonesRepo.save(zone);
 
     await this.redisCacheService.deleteByPattern('zones:*');

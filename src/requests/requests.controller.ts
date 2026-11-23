@@ -703,6 +703,12 @@ export class RequestsController {
   // 20. Fetch Request details by ID
   @Get(':id')
   async getRequestDetailsById(@Param('id') id: string) {
+    if (!id || isNaN(Number(id)) || Number(id) <= 0) {
+      return {
+        status: HttpStatus.BAD_REQUEST,
+        message: `Invalid request ID: ${id}`,
+      };
+    }
     try {
       const data = await this.requestsService.getRequestDetailsById(Number(id));
       if (!data) {
